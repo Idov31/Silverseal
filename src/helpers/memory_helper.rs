@@ -14,7 +14,7 @@ extern crate alloc;
 */
 pub const LINUX_BOOT_IMAGE_SIGNATURE: &[u8] = &[0x48, 0x89, 0x75, 0xB8, 0xFF, 0xD0];
 
-pub const INLINE_HOOK_SIZE: usize = 12;
+pub const INLINE_HOOK_SIZE: usize = 13;
 
 pub struct InlineHook {
     pub target: usize,
@@ -71,11 +71,12 @@ pub fn inline_hook(target: usize, hook: usize) -> Result<InlineHook, Status> {
     };
 
     let mut patch = [0u8; INLINE_HOOK_SIZE];
-    patch[0] = 0x48;
-    patch[1] = 0xB8;
+    patch[0] = 0x49;
+    patch[1] = 0xBA;
     patch[2..10].copy_from_slice(&(hook as u64).to_le_bytes());
-    patch[10] = 0xFF;
-    patch[11] = 0xE0;
+    patch[10] = 0x41;
+    patch[11] = 0xFF;
+    patch[12] = 0xD2;
 
     let target_ptr = target as *mut u8;
 
