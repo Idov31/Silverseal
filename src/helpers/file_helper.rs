@@ -115,6 +115,12 @@ pub fn is_faulty_env() -> bool {
 fn open_failsafe_file(mode: FileMode) -> uefi::Result<RegularFile> {
     let mut sfs = boot::open_protocol_exclusive::<SimpleFileSystem>(boot::image_handle())?;
     let mut root = sfs.open_volume()?;
-    let file_handle = root.open(FAILSAFE_PATH, mode, FileAttribute::empty())?;
+
+    let open_mode = match mode {
+        FileMode::Read => FileMode::Read,
+        FileMode::ReadWrite | FileMode::CreateReadWrite => FileMode::CreateReadWrite,
+    };
+
+    let file_handle = root.open(FAILSAFE_PATH, open_mode, FileAttribute::empty())?;
     Ok(unsafe { RegularFile::new(file_handle) })
 }
