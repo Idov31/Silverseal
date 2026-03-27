@@ -60,29 +60,34 @@ pub fn binary_search(data_address: usize, data_size: usize, pattern: &[u8]) -> O
 * - Err(Status): If the target or hook address is invalid.
 */
 pub fn inline_hook(target: usize, hook: usize) -> Result<InlineHook, Status> {
+    if target == 0 || hook == 0 {
+        return Err(Status::INVALID_PARAMETER);
+    }
+
     let mut inline_hook = InlineHook {
         target,
         hook,
         original_bytes: [0; INLINE_HOOK_SIZE],
     };
-    if target == 0 || hook == 0 {
-        return Err(Status::INVALID_PARAMETER);
-    }
-    let target_ptr = target as *mut u8;
-    
-    unsafe {
-        for i in 0..INLINE_HOOK_SIZE {
-            inline_hook.original_bytes[i] = core::ptr::read(target_ptr.add(i));
-        }
 
-        // mov rax, hook
-        core::ptr::write(target_ptr, 0x48);
-        core::ptr::write(target_ptr.add(1), 0xB8);
-        core::ptr::write_unaligned(target_ptr.add(2) as *mut usize, hook);
-        // jmp rax
-        core::ptr::write(target_ptr.add(10), 0xFF);
-        core::ptr::write(target_ptr.add(11), 0xE0);
+    let mut patch = [0u8; INLINE_HOOK_SIZE];
+    patch[0] = 0x48;
+    patch[1] = 0xB8;
+    patch[2..10].copy_from_slice(&(hook as u64).to_le_bytes());
+    patch[10] = 0xFF;
+    patch[11] = 0xE0;
+
+    let target_ptr = target as *mut u8;
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            target_ptr as *const u8,
+            inline_hook.original_bytes.as_mut_ptr(),
+            INLINE_HOOK_SIZE,
+        );
+        core::ptr::copy_nonoverlapping(patch.as_ptr(), target_ptr, INLINE_HOOK_SIZE);
     }
+
     Ok(inline_hook)
 }
 
@@ -98,15 +103,15 @@ pub fn inline_hook(target: usize, hook: usize) -> Result<InlineHook, Status> {
 * - Err(Status): If the target address is invalid or the original bytes are empty.
 */
 pub fn restore_inline_hook(target: usize, original_bytes: &[u8]) -> Result<(), Status> {
-    if target == 0 || original_bytes.is_empty() {
+    if target == 0 || original_bytes.len() != INLINE_HOOK_SIZE {
         return Err(Status::INVALID_PARAMETER);
     }
+
     let target_ptr = target as *mut u8;
 
     unsafe {
-        for (i, &byte) in original_bytes.iter().enumerate() {
-            core::ptr::write(target_ptr.add(i), byte);
-        }
+        core::ptr::copy_nonoverlapping(original_bytes.as_ptr(), target_ptr, INLINE_HOOK_SIZE);
     }
+
     Ok(())
 }

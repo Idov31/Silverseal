@@ -14,6 +14,11 @@ use crate::helpers::{
     memory_helper::{LINUX_BOOT_IMAGE_SIGNATURE, binary_search, inline_hook},
 };
 
+fn log_and_stall(msg: &str) {
+    info!("{}", msg);
+    boot::stall(Duration::from_secs(5));
+}
+
 #[entry]
 fn main() -> Status {
     if let Err(e) = uefi::helpers::init() {
@@ -24,16 +29,16 @@ fn main() -> Status {
     let original_grub_handle = match load_original_grub() {
         Ok(handle) => handle,
         Err(e) => {
-            info!("Failed to load original GRUB: {:?}", e);
-            boot::stall(Duration::from_secs(5));
+            log_and_stall("Failed to load original GRUB");
+            info!("Reason: {:?}", e);
             return e.status();
         }
     };
     let loaded_image = match boot::open_protocol_exclusive::<LoadedImage>(original_grub_handle) {
         Ok(image) => image,
         Err(e) => {
-            info!("Failed to open LoadedImage protocol: {:?}", e);
-            boot::stall(Duration::from_secs(5));
+            log_and_stall("Failed to open LoadedImage protocol");
+            info!("Reason: {:?}", e);
             return e.status();
         }
     };
@@ -42,21 +47,20 @@ fn main() -> Status {
     let target = match binary_search(base as usize, size as usize, LINUX_BOOT_IMAGE_SIGNATURE) {
         Some(addr) => addr,
         None => {
-            info!("Failed to find target function in original GRUB");
-            boot::stall(Duration::from_secs(5));
+            log_and_stall("Failed to find target function in original GRUB");
             return Status::NOT_FOUND;
         }
     };
     info!("Found target function at address: {:#x}", target);
 
     // Install the hook at the found address
-    let linux_boot_image_hook = grub_arch_efi_linux_boot_image_hook as *const() as usize;
+    let linux_boot_image_hook = grub_arch_efi_linux_boot_image_hook as *const () as usize;
 
     let hook_info = match inline_hook(target, linux_boot_image_hook) {
         Ok(info) => info,
         Err(e) => {
-            info!("Failed to install inline hook: {:?}", e);
-            boot::stall(Duration::from_secs(5));
+            log_and_stall("Failed to install inline hook");
+            info!("Reason: {:?}", e);
             return e;
         }
     };
