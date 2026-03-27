@@ -1,14 +1,24 @@
-use uefi::{CStr16, cstr16, Handle};
 use uefi::boot::{self, LoadImageSource};
 use uefi::proto::BootPolicy;
-use uefi::proto::device_path::{build, DeviceSubType, DeviceType, LoadedImageDevicePath};
 use uefi::proto::device_path::build::DevicePathBuilder;
+use uefi::proto::device_path::{DeviceSubType, DeviceType, LoadedImageDevicePath, build};
+use uefi::{CStr16, Handle, cstr16};
 
 extern crate alloc;
 use alloc::vec::Vec;
 
 const GRUB_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\grubx64.efi.original");
 
+/*
+ * Loads the original GRUB.
+ *
+ * Args:
+ * - None
+ *
+ * Returns:
+ * - Ok(Handle): Handle to the loaded original GRUB image.
+ * - Err(uefi::Error): If loading fails, returns the corresponding UEFI error
+ */
 pub fn load_original_grub() -> uefi::Result<Handle> {
     let loaded_image_device_path =
         boot::open_protocol_exclusive::<LoadedImageDevicePath>(boot::image_handle())?;
