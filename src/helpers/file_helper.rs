@@ -71,23 +71,19 @@ pub fn load_original_grub() -> uefi::Result<Handle> {
 * - None
 */
 pub fn increase_fail_attempts() {
-    // Read current counter
-    let mut counter: u16 = 0;
-    
-    if let Ok(mut file) = open_failsafe_for_read() {
-        let mut buf: [u8; 2] = [0; 2];
-        if let Ok(bytes_read) = file.read(&mut buf) {
-            if bytes_read >= 2 {
-                counter = u16::from_le_bytes(buf);
-            }
+    if let Ok(mut file) = open_failsafe_file(FileMode::ReadWrite) {
+        // Read current counter
+        let mut buf = [0u8; 2];
+        let counter = match file.read(&mut buf) {
+            Ok(bytes_read) if bytes_read >= 2 => u16::from_le_bytes(buf),
+            _ => 0,
+        };
+        
+        // Write new counter
+        let new_counter = counter.saturating_add(1);
+        if file.set_position(0).is_ok() {
+            let _ = file.write(&new_counter.to_le_bytes());
         }
-    }
-    
-    // Write new counter
-    let new_counter = counter.saturating_add(1);
-    if let Ok(mut file) = open_failsafe_for_write() {
-        let _ = file.set_position(0);
-        let _ = file.write(&new_counter.to_le_bytes());
     }
 }
 
@@ -101,32 +97,24 @@ pub fn increase_fail_attempts() {
 * - bool: True if the environment is considered faulty, false otherwise.
 */
 pub fn is_faulty_env() -> bool {
-    match open_failsafe_for_read() {
-        Ok(mut file) => {
+    open_failsafe_file(FileMode::Read)
+        .ok()
+        .and_then(|mut file| {
             let mut buf = [0u8; 2];
-            
-            match file.read(&mut buf) {
-                Ok(bytes_read) if bytes_read >= 2 => {
-                    let counter = u16::from_le_bytes(buf);
-                    counter >= MAX_FAIL_ATTEMPTS
+            file.read(&mut buf).ok().and_then(|bytes_read| {
+                if bytes_read >= 2 {
+                    Some(u16::from_le_bytes(buf) >= MAX_FAIL_ATTEMPTS)
+                } else {
+                    None
                 }
-                _ => false,
-            }
-        }
-        Err(_) => false,
-    }
+            })
+        })
+        .unwrap_or(false)
 }
 
-fn open_failsafe_for_read() -> uefi::Result<RegularFile> {
+fn open_failsafe_file(mode: FileMode) -> uefi::Result<RegularFile> {
     let mut sfs = boot::open_protocol_exclusive::<SimpleFileSystem>(boot::image_handle())?;
     let mut root = sfs.open_volume()?;
-    let file_handle = root.open(FAILSAFE_PATH, FileMode::Read, FileAttribute::empty())?;
-    Ok(unsafe { RegularFile::new(file_handle) })
-}
-
-fn open_failsafe_for_write() -> uefi::Result<RegularFile> {
-    let mut sfs = boot::open_protocol_exclusive::<SimpleFileSystem>(boot::image_handle())?;
-    let mut root = sfs.open_volume()?;
-    let file_handle = root.open(FAILSAFE_PATH, FileMode::ReadWrite, FileAttribute::empty())?;
+    let file_handle = root.open(FAILSAFE_PATH, mode, FileAttribute::empty())?;
     Ok(unsafe { RegularFile::new(file_handle) })
 }
