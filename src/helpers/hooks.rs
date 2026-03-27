@@ -17,7 +17,7 @@ pub fn grub_arch_efi_linux_boot_image_hook(
     args: *const u8,
 ) -> i32 {
     info!(
-        "grub_arch_efi_linux_boot_image_hook called with kernel_entry: {:#x}, kernel_size: {}, args: {:#x}",
+        "grub_arch_efi_linux_boot_image_hook called with kernel_entry: {}, kernel_size: {}, args: {:#x}",
         kernel_entry, kernel_size, args as usize
     );
     boot::stall(Duration::from_secs(5));

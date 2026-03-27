@@ -9,7 +9,7 @@ use uefi::proto::loaded_image::LoadedImage;
 
 pub mod helpers;
 use crate::helpers::{
-    file_helper::load_original_grub,
+    file_helper::{increase_fail_attempts, is_faulty_env, load_original_grub},
     hooks::{GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE, grub_arch_efi_linux_boot_image_hook},
     memory_helper::{LINUX_BOOT_IMAGE_SIGNATURE, binary_search, inline_hook},
 };
@@ -25,7 +25,7 @@ fn main() -> Status {
         return e.status();
     }
     info!("Silverseal logo placeholder");
-    boot::stall(Duration::from_secs(5));
+
     let original_grub_handle = match load_original_grub() {
         Ok(handle) => handle,
         Err(e) => {
@@ -44,28 +44,33 @@ fn main() -> Status {
     };
     let (base, size) = loaded_image.info();
     info!("Original GRUB base: {:?}, size: {:?}", base, size);
-    let target = match binary_search(base as usize, size as usize, LINUX_BOOT_IMAGE_SIGNATURE) {
-        Some(addr) => addr,
-        None => {
-            log_and_stall("Failed to find target function in original GRUB");
-            return Status::NOT_FOUND;
-        }
-    };
-    info!("Found target function at address: {:#x}", target);
 
-    // Install the hook at the found address
-    let linux_boot_image_hook = grub_arch_efi_linux_boot_image_hook as *const () as usize;
+    if !is_faulty_env() {
+        let target = match binary_search(base as usize, size as usize, LINUX_BOOT_IMAGE_SIGNATURE) {
+            Some(addr) => addr,
+            None => {
+                log_and_stall("Failed to find target function in original GRUB");
+                increase_fail_attempts();
+                return Status::NOT_FOUND;
+            }
+        };
+        info!("Found target function at address: {:#x}", target);
 
-    let hook_info = match inline_hook(target, linux_boot_image_hook) {
-        Ok(info) => info,
-        Err(e) => {
-            log_and_stall("Failed to install inline hook");
-            info!("Reason: {:?}", e);
-            return e;
+        // Install the hook at the found address
+        let linux_boot_image_hook = grub_arch_efi_linux_boot_image_hook as *const () as usize;
+
+        let hook_info = match inline_hook(target, linux_boot_image_hook) {
+            Ok(info) => info,
+            Err(e) => {
+                log_and_stall("Failed to install inline hook");
+                info!("Reason: {:?}", e);
+                increase_fail_attempts();
+                return e;
+            }
+        };
+        unsafe {
+            GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE = hook_info;
         }
-    };
-    unsafe {
-        GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE = hook_info;
     }
 
     if let Err(e) = boot::start_image(original_grub_handle) {
