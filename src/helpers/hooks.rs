@@ -17,17 +17,23 @@ pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
     args: *const u8,
 ) -> i32 {
     let original_fn_addr: usize;
+    let real_kernel_entry: usize;
     unsafe {
         core::arch::asm!(
             "mov {}, rax",
             out(reg) original_fn_addr,
             options(nomem, nostack, preserves_flags)
         );
+        core::arch::asm!(
+            "mov {}, r12",
+            out(reg) real_kernel_entry,
+            options(nomem, nostack, preserves_flags)
+        );
     }
 
     info!(
-        "grub_arch_efi_linux_boot_image_hook called with kernel_entry: {}, kernel_size: {}, args: {:#x}",
-        kernel_entry, kernel_size, args as usize
+        "grub_arch_efi_linux_boot_image_hook called with kernel_entry: {:#x}, kernel_size: {:#x}, args: {:#x}",
+        real_kernel_entry, kernel_size, args as usize
     );
     boot::stall(Duration::from_secs(5));
 
