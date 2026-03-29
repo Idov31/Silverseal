@@ -10,9 +10,11 @@ use uefi::proto::loaded_image::LoadedImage;
 pub mod helpers;
 use crate::helpers::{
     file_helper::{increase_fail_attempts, is_faulty_env, load_original_grub},
-    hooks::{GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE, grub_arch_efi_linux_boot_image_hook},
-    memory_helper::{LINUX_BOOT_IMAGE_SIGNATURE, binary_search, inline_hook},
+    memory_helper::{LINUX_BOOT_IMAGE_SIGNATURE, binary_search, inline_hook}
 };
+
+pub mod hooks;
+use crate::hooks::hooks::{GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE, grub_arch_efi_linux_boot_image_hook};
 
 fn log_and_stall(msg: &str) {
     info!("{}", msg);
