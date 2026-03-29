@@ -13,16 +13,15 @@ const GRUB_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\grubx64.efi.original");
 const FAILSAFE_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\failsafe");
 const MAX_FAIL_ATTEMPTS: u16 = 1;
 
-/*
- * Loads the original GRUB.
- *
- * Args:
- * - None
- *
- * Returns:
- * - Ok(Handle): Handle to the loaded original GRUB image.
- * - Err(uefi::Error): If loading fails, returns the corresponding UEFI error
- */
+
+/// load_original_grub attempts to load the original GRUB image from the same device as the current image, using a predefined path. 
+/// 
+/// # Arguments
+/// - None
+/// 
+/// # Returns
+/// - `Ok(Handle)`: Handle to the loaded original GRUB image.
+/// - `Err(uefi::Error)`: If loading fails, returns the corresponding U
 pub fn load_original_grub() -> uefi::Result<Handle> {
     let loaded_image_device_path =
         boot::open_protocol_exclusive::<LoadedImageDevicePath>(boot::image_handle())?;
@@ -61,15 +60,14 @@ pub fn load_original_grub() -> uefi::Result<Handle> {
     Ok(new_image)
 }
 
-/*
-* Increases the fail attempts counter in the failsafe file to prevent booting into bad GRUB in case of repeated failures.
-*
-* Args:
-* - None
-*
-* Returns:
-* - None
-*/
+
+/// increase_fail_attempts increases the fail attempts counter in the failsafe file to prevent booting into bad GRUB in case of repeated failures.
+/// 
+/// # Arguments
+/// - None
+/// 
+/// # Returns
+/// - None
 pub fn increase_fail_attempts() {
     if let Ok(mut file) = open_failsafe_file(FileMode::ReadWrite) {
         // Read current counter
@@ -87,15 +85,14 @@ pub fn increase_fail_attempts() {
     }
 }
 
-/*
-* Checks the fail attempts counter in the failsafe file to determine if attempt to hook or restore the original GRUB should be made.
-*
-* Args:
-* - None
-*
-* Returns:
-* - bool: True if the environment is considered faulty, false otherwise.
-*/
+
+/// is_faulty_env checks the fail attempts counter in the failsafe file to determine if the environment is considered faulty.
+/// 
+/// # Arguments
+/// - None
+/// 
+/// # Returns
+/// - `bool`: True if the environment is considered faulty, false otherwise.
 pub fn is_faulty_env() -> bool {
     open_failsafe_file(FileMode::Read)
         .ok()
@@ -112,6 +109,15 @@ pub fn is_faulty_env() -> bool {
         .unwrap_or(false)
 }
 
+/// open_failsafe_file opens the failsafe file with the specified mode, creating it if necessary. 
+/// This file is used to track fail attempts and determine if the environment is faulty.
+/// 
+/// # Arguments
+/// - `mode`: The mode in which to open the file.
+/// 
+/// # Returns
+/// - `Ok(RegularFile)`: The opened failsafe file.
+/// - `Err(uefi::Error)`: If opening the file fails, returns the corresponding UEFI error.
 fn open_failsafe_file(mode: FileMode) -> uefi::Result<RegularFile> {
     let mut sfs = boot::open_protocol_exclusive::<SimpleFileSystem>(boot::image_handle())?;
     let mut root = sfs.open_volume()?;

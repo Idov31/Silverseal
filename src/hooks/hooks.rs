@@ -11,6 +11,16 @@ pub static mut GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE: InlineHook = InlineHo
     original_bytes: [0; INLINE_HOOK_SIZE],
 };
 
+/// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems. 
+/// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
+/// 
+/// # Arguments
+/// - `kernel_entry`: The entry point of the Linux kernel.
+/// - `kernel_size`: The size of the Linux kernel.
+/// - `args`: Additional arguments passed to the original function.
+/// 
+/// # Returns
+/// - `i32`: The return value from the original function, or -1 if an error occurs.
 pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
     kernel_entry: usize,
     kernel_size: usize,
