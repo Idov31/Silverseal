@@ -1,8 +1,15 @@
 #![no_main]
 #![no_std]
 
+const COM1_PORT: u16 = 0x3f8;
+
+#[allow(dead_code)]
+const COM2_PORT: u16 = 0x2f8;
+
 use core::time::Duration;
-use log::info;
+
+use com_logger;
+use log::{debug, error, info, LevelFilter};
 use uefi::boot::{self};
 use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
@@ -10,35 +17,38 @@ use uefi::proto::loaded_image::LoadedImage;
 pub mod helpers;
 use crate::helpers::{
     file_helper::{increase_fail_attempts, is_faulty_env, load_original_grub},
-    hooks::{GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE, grub_arch_efi_linux_boot_image_hook},
     memory_helper::{LINUX_BOOT_IMAGE_SIGNATURE, binary_search, inline_hook},
 };
 
-fn log_and_stall(msg: &str) {
-    info!("{}", msg);
-    boot::stall(Duration::from_secs(5));
-}
+pub mod hooks;
+use crate::hooks::hooks::{
+    GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE, grub_arch_efi_linux_boot_image_hook,
+};
 
 #[entry]
 fn main() -> Status {
     if let Err(e) = uefi::helpers::init() {
         return e.status();
     }
+    com_logger::builder()
+        .base(COM1_PORT)
+        .filter(LevelFilter::Debug)
+        .setup();
     info!("Silverseal logo placeholder");
 
     let original_grub_handle = match load_original_grub() {
         Ok(handle) => handle,
         Err(e) => {
-            log_and_stall("Failed to load original GRUB");
-            info!("Reason: {:?}", e);
+            error!("Failed to load original GRUB, reason {:?}", e);
+            boot::stall(Duration::from_secs(5));
             return e.status();
         }
     };
     let loaded_image = match boot::open_protocol_exclusive::<LoadedImage>(original_grub_handle) {
         Ok(image) => image,
         Err(e) => {
-            log_and_stall("Failed to open LoadedImage protocol");
-            info!("Reason: {:?}", e);
+            error!("Failed to open LoadedImage protocol, reason {:?}", e);
+            boot::stall(Duration::from_secs(5));
             return e.status();
         }
     };
@@ -49,12 +59,12 @@ fn main() -> Status {
         let target = match binary_search(base as usize, size as usize, LINUX_BOOT_IMAGE_SIGNATURE) {
             Some(addr) => addr,
             None => {
-                log_and_stall("Failed to find target function in original GRUB");
+                error!("Failed to find target function in original GRUB");
                 increase_fail_attempts();
                 return Status::NOT_FOUND;
             }
         };
-        info!("Found target function at address: {:#x}", target);
+        debug!("Found target function at address: {:#x}", target);
 
         // Install the hook at the found address
         let linux_boot_image_hook = grub_arch_efi_linux_boot_image_hook as *const () as usize;
@@ -62,8 +72,8 @@ fn main() -> Status {
         let hook_info = match inline_hook(target, linux_boot_image_hook) {
             Ok(info) => info,
             Err(e) => {
-                log_and_stall("Failed to install inline hook");
-                info!("Reason: {:?}", e);
+                error!("Failed to install inline hook, reason {:?}", e);
+                boot::stall(Duration::from_secs(5));
                 increase_fail_attempts();
                 return e;
             }
@@ -72,9 +82,11 @@ fn main() -> Status {
             GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE = hook_info;
         }
     }
+    debug!("Starting GRUB...");
 
     if let Err(e) = boot::start_image(original_grub_handle) {
-        info!("Failed to start original GRUB: {:?}", e);
+        error!("Failed to start original GRUB: {:?}", e);
+        boot::stall(Duration::from_secs(5));
         return e.status();
     }
     Status::SUCCESS

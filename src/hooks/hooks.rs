@@ -1,9 +1,9 @@
 use core::time::Duration;
 
-use log::info;
 use uefi::boot;
 
 use crate::helpers::memory_helper::{INLINE_HOOK_SIZE, InlineHook, restore_inline_hook};
+use log::{debug, error};
 
 pub static mut GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE: InlineHook = InlineHook {
     target: 0,
@@ -11,6 +11,16 @@ pub static mut GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE: InlineHook = InlineHo
     original_bytes: [0; INLINE_HOOK_SIZE],
 };
 
+/// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
+/// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
+///
+/// # Arguments
+/// - `kernel_entry`: The entry point of the Linux kernel.
+/// - `kernel_size`: The size of the Linux kernel.
+/// - `args`: Additional arguments passed to the original function.
+///
+/// # Returns
+/// - `i32`: The return value from the original function, or -1 if an error occurs.
 pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
     kernel_entry: usize,
     kernel_size: usize,
@@ -31,7 +41,7 @@ pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
         );
     }
 
-    info!(
+    debug!(
         "grub_arch_efi_linux_boot_image_hook called with kernel_entry: {:#x}, kernel_size: {:#x}, args: {:#x}",
         real_kernel_entry, kernel_size, args as usize
     );
@@ -42,29 +52,32 @@ pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
         core::ptr::addr_of!(GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE.target).read_volatile()
     };
     let original_bytes = unsafe {
-        core::ptr::addr_of!(GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE.original_bytes).read_volatile()
+        core::ptr::addr_of!(GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE.original_bytes)
+            .read_volatile()
     };
 
     if target == 0 {
-        info!("Hook target was not initialized");
+        error!("Hook target was not initialized");
+        boot::stall(Duration::from_secs(5));
         return -1;
     }
 
     if original_fn_addr == 0 {
-        info!("Original function address was not preserved");
+        error!("Original function address was not preserved");
+        boot::stall(Duration::from_secs(5));
         return -1;
     }
-    
+
     if let Err(e) = restore_inline_hook(target, &original_bytes) {
-        info!("Failed to restore original function: {}", e);
+        error!("Failed to restore original function: {}", e);
+        boot::stall(Duration::from_secs(5));
         return -1;
     }
 
     // TODO: Deploy another hook here to overwrite specific kernel handler.
 
     // Call the original callee that was held in rax at the patched call site.
-    let original_fn: extern "C" fn(usize, usize, *const u8) -> i32 = unsafe {
-        core::mem::transmute(original_fn_addr)
-    };
+    let original_fn: extern "C" fn(usize, usize, *const u8) -> i32 =
+        unsafe { core::mem::transmute(original_fn_addr) };
     original_fn(kernel_entry, kernel_size, args)
 }

@@ -11,4 +11,5 @@ panic = "abort"
 
 [dependencies]
 log = "0.4.29"
-uefi = { version = "0.36.1", features = ["logger", "panic_handler", "global_allocator", "alloc"] }
+com_logger = "0.1.2"
+uefi = { version = "0.36.1", features = ["panic_handler", "global_allocator", "alloc"] }
