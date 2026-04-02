@@ -6,8 +6,6 @@ const COM1_PORT: u16 = 0x3f8;
 #[allow(dead_code)]
 const COM2_PORT: u16 = 0x2f8;
 
-use core::time::Duration;
-
 use com_logger;
 use log::{debug, error, info, LevelFilter};
 use uefi::boot::{self};
@@ -40,7 +38,6 @@ fn main() -> Status {
         Ok(handle) => handle,
         Err(e) => {
             error!("Failed to load original GRUB, reason {:?}", e);
-            boot::stall(Duration::from_secs(5));
             return e.status();
         }
     };
@@ -48,7 +45,6 @@ fn main() -> Status {
         Ok(image) => image,
         Err(e) => {
             error!("Failed to open LoadedImage protocol, reason {:?}", e);
-            boot::stall(Duration::from_secs(5));
             return e.status();
         }
     };
@@ -73,7 +69,6 @@ fn main() -> Status {
             Ok(info) => info,
             Err(e) => {
                 error!("Failed to install inline hook, reason {:?}", e);
-                boot::stall(Duration::from_secs(5));
                 increase_fail_attempts();
                 return e;
             }
@@ -86,7 +81,6 @@ fn main() -> Status {
 
     if let Err(e) = boot::start_image(original_grub_handle) {
         error!("Failed to start original GRUB: {:?}", e);
-        boot::stall(Duration::from_secs(5));
         return e.status();
     }
     Status::SUCCESS
