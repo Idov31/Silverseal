@@ -17,4 +17,4 @@ uefi = { version = "0.36.1", features = [
     "global_allocator",
     "alloc",
 ] }
-elf = "=0.8.0"
+elf = { version = "=0.8.0", default-features = false }

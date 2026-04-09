@@ -31,6 +31,7 @@ pub struct InlineHook {
     pub original_bytes: [u8; INLINE_HOOK_SIZE],
 }
 
+#[derive(Debug)]
 pub enum InitcallPhase {
     EarlyInitcall,
     CoreInitcall,
@@ -199,7 +200,7 @@ pub fn get_initcall_phase_address(
     })
     .ok()?;
 
-    let init_data_section: SectionHeader = vmlinux.find_section_by_name(".init.data").ok()?;
+    let init_data_section: SectionHeader = vmlinux.section_header_by_name(".init.data").ok()??;
     let init_data_address = init_data_section.sh_addr as usize;
     let init_data_size = init_data_section.sh_size as usize;
     debug!(

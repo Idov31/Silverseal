@@ -76,10 +76,10 @@ pub fn cave_finder(
 
     let data = unsafe { core::slice::from_raw_parts(data_address as *const u8, data_size) };
     let elf = ElfBytes::<AnyEndian>::minimal_parse(data).ok()?;
-    let sections = elf.section_headers().ok()?;
+    let sections = elf.section_headers()?;
 
     for section in sections.iter() {
-        if section.sh_size == 0 || !section_matches_permissions(section, cave_permissions) {
+        if section.sh_size == 0 || !section_matches_permissions(&section, cave_permissions) {
             continue;
         }
 
@@ -89,7 +89,7 @@ pub fn cave_finder(
         let Some(section_size) = usize::try_from(section.sh_size).ok() else {
             continue;
         };
-        let Some(section_end) = section_offset.checked_add(section_size) else {
+        let Some(section_end): Option<usize> = section_offset.checked_add(section_size) else {
             continue;
         };
 
@@ -267,4 +267,3 @@ fn open_failsafe_file(mode: FileMode) -> uefi::Result<RegularFile> {
     let file_handle = root.open(FAILSAFE_PATH, open_mode, FileAttribute::empty())?;
     Ok(unsafe { RegularFile::new(file_handle) })
 }
-
