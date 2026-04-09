@@ -18,7 +18,7 @@ git clone https://github.com/idov31/Silverseal.git
 
 ```bash
 cd Silverseal
-cargo build --release
+cargo build-all --release
 ```
 
 * Replace the grub
@@ -33,7 +33,7 @@ sudo ./setup_silverseal.sh
 
 #### Linux
 
-1. **Identify the serial port:**
+* **Identify the serial port:**
 
 ```bash
 ls -la /dev/ttyS*
@@ -41,7 +41,7 @@ ls -la /dev/ttyS*
 
 Common ports: `/dev/ttyS0` (COM1), `/dev/ttyS1` (COM2)
 
-2. **Monitor serial output with `minicom`:**
+* **Monitor serial output with `minicom`:**
 
 ```bash
 sudo minicom -D /dev/ttyS0 -b 115200

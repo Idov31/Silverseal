@@ -1,20 +1,13 @@
-[package]
-name = "Silverseal"
-version = "1.0.0"
-edition = "2024"
+[workspace]
+
+members = [
+    "silverseal-bootkit",
+    "silverseal-rootkit"
+]
+resolver = "3"
 
 [profile.dev]
 panic = "abort"
 
 [profile.release]
 panic = "abort"
-
-[dependencies]
-log = "0.4.29"
-com_logger = "0.1.2"
-uefi = { version = "0.36.1", features = [
-    "panic_handler",
-    "global_allocator",
-    "alloc",
-] }
-elf = { version = "=0.8.0", default-features = false }
