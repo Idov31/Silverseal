@@ -1,16 +1,17 @@
 use uefi::boot::{self, LoadImageSource};
 use uefi::proto::BootPolicy;
 use uefi::proto::device_path::build::DevicePathBuilder;
-use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::device_path::{DeviceSubType, DeviceType, LoadedImageDevicePath, build};
-use uefi::proto::media::file::{File, FileMode, FileAttribute, RegularFile};
+use uefi::proto::media::file::{File, FileAttribute, FileMode, RegularFile};
+use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::{CStr16, Handle, cstr16};
 
 use core::ops::{BitOr, BitOrAssign};
-use elf::abi::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE};
 use elf::ElfBytes;
+use elf::abi::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE};
 use elf::endian::AnyEndian;
 use elf::section::SectionHeader;
+use log::debug;
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -101,9 +102,16 @@ pub fn cave_finder(
         let Some(cave_offset) = find_cave_offset(section_data, cave_size) else {
             continue;
         };
-        return section_offset
+        let cave_address = section_offset
             .checked_add(cave_offset)
             .and_then(|offset| data_address.checked_add(offset));
+        if let Some(address) = cave_address {
+            debug!(
+                "Found code cave: section={:#x}, cave_offset={:#x}, address={:#x}",
+                section.sh_addr, cave_offset, address
+            );
+        }
+        return cave_address;
     }
 
     None
@@ -126,21 +134,13 @@ fn find_cave_offset(section_data: &[u8], cave_size: usize) -> Option<usize> {
         return None;
     }
 
-    let mut current_len = 0usize;
-    let mut current_start = 0usize;
-
-    for (index, byte) in section_data.iter().enumerate() {
-        if *byte == 0x00 || *byte == 0x90 {
-            if current_len == 0 {
-                current_start = index;
-            }
-
-            current_len += 1;
-            if current_len >= cave_size {
-                return Some(current_start);
-            }
-        } else {
-            current_len = 0;
+    for start in 0..=section_data.len() - cave_size {
+        let end = start + cave_size;
+        if section_data[start..end]
+            .iter()
+            .all(|byte| *byte == 0x00 || *byte == 0x90)
+        {
+            return Some(start);
         }
     }
 
@@ -148,11 +148,11 @@ fn find_cave_offset(section_data: &[u8], cave_size: usize) -> Option<usize> {
 }
 
 /// ## Description
-/// load_original_grub attempts to load the original GRUB image from the same device as the current image, using a predefined path. 
-/// 
+/// load_original_grub attempts to load the original GRUB image from the same device as the current image, using a predefined path.
+///
 /// ## Arguments
 /// - None
-/// 
+///
 /// ## Returns
 /// - `Ok(Handle)`: Handle to the loaded original GRUB image.
 /// - `Err(uefi::Error)`: If loading fails, returns the corresponding U
@@ -194,13 +194,12 @@ pub fn load_original_grub() -> uefi::Result<Handle> {
     Ok(new_image)
 }
 
-
 /// ## Description
 /// increase_fail_attempts increases the fail attempts counter in the failsafe file to prevent booting into bad GRUB in case of repeated failures.
-/// 
+///
 /// ## Arguments
 /// - None
-/// 
+///
 /// ## Returns
 /// - None
 pub fn increase_fail_attempts() {
@@ -211,7 +210,7 @@ pub fn increase_fail_attempts() {
             Ok(bytes_read) if bytes_read >= 2 => u16::from_le_bytes(buf),
             _ => 0,
         };
-        
+
         // Write new counter
         let new_counter = counter.saturating_add(1);
         if file.set_position(0).is_ok() {
@@ -220,13 +219,12 @@ pub fn increase_fail_attempts() {
     }
 }
 
-
 /// ## Description
 /// is_faulty_env checks the fail attempts counter in the failsafe file to determine if the environment is considered faulty.
-/// 
+///
 /// ## Arguments
 /// - None
-/// 
+///
 /// ## Returns
 /// - `bool`: True if the environment is considered faulty, false otherwise.
 pub fn is_faulty_env() -> bool {
@@ -246,12 +244,12 @@ pub fn is_faulty_env() -> bool {
 }
 
 /// ## Description
-/// open_failsafe_file opens the failsafe file with the specified mode, creating it if necessary. 
+/// open_failsafe_file opens the failsafe file with the specified mode, creating it if necessary.
 /// This file is used to track fail attempts and determine if the environment is faulty.
-/// 
+///
 /// ## Arguments
 /// - `mode`: The mode in which to open the file.
-/// 
+///
 /// ## Returns
 /// - `Ok(RegularFile)`: The opened failsafe file.
 /// - `Err(uefi::Error)`: If opening the file fails, returns the corresponding UEFI error.

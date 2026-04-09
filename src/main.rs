@@ -73,7 +73,7 @@ fn main() -> Status {
             GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE = hook_info;
         }
     }
-    debug!("Starting GRUB...");
+    info!("Starting GRUB...");
 
     if let Err(e) = boot::start_image(original_grub_handle) {
         error!("Failed to start original GRUB: {:?}", e);
