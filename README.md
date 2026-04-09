@@ -1,6 +1,8 @@
 # Silverseal
 
-Silverseal is a Linux framework containing a bootkit, rootkit loader and a rootkit
+![Silverseal Logo](./resources/silverseal_logo.png)
+
+Silverseal is a Linux framework containing a bootkit and a rootkit.
 
 ## Setup
 
