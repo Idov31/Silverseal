@@ -1,4 +1,5 @@
 use elf::ElfBytes;
+use elf::abi::PT_LOAD;
 use elf::endian::AnyEndian;
 use elf::section::SectionHeader;
 use uefi::Status;
@@ -201,29 +202,126 @@ pub fn get_initcall_phase_address(
     .ok()?;
 
     let init_data_section: SectionHeader = vmlinux.section_header_by_name(".init.data").ok()??;
-    let init_data_address = init_data_section.sh_addr as usize;
-    let init_data_size = init_data_section.sh_size as usize;
+    let init_data_virtual_address = usize::try_from(init_data_section.sh_addr).ok()?;
+    let init_data_offset = usize::try_from(init_data_section.sh_offset).ok()?;
+    let init_data_size = usize::try_from(init_data_section.sh_size).ok()?;
+    let init_data_end = init_data_offset.checked_add(init_data_size)?;
+
+    if init_data_end > kernel_size {
+        return None;
+    }
+
+    let init_data_physical_address = kernel_base.checked_add(init_data_offset)?;
     debug!(
-        "Found .init.data section at address: {:#x}, size: {:#x}",
-        init_data_address, init_data_size
+        "Found .init.data section: virt={:#x}, phys={:#x}, offset={:#x}, size={:#x}",
+        init_data_virtual_address, init_data_physical_address, init_data_offset, init_data_size
     );
-    let initcall_array_address = init_data_address + INITCALL_ARRAY_OFFSET;
-    let initcall_ptr_address = match phase {
-        InitcallPhase::EarlyInitcall => initcall_array_address,
-        InitcallPhase::CoreInitcall => initcall_array_address + 8,
-        InitcallPhase::PostCoreInitcall => initcall_array_address + 16,
-        InitcallPhase::ArchInitcall => initcall_array_address + 24,
-        InitcallPhase::SubsysInitcall => initcall_array_address + 32,
-        InitcallPhase::FsInitcall => initcall_array_address + 40,
-        InitcallPhase::DeviceInitcall => initcall_array_address + 48,
-        InitcallPhase::LateInitcall => initcall_array_address + 56,
-        InitcallPhase::ConsoleInitcall => initcall_array_address + 64,
+
+    let initcall_array_physical_address =
+        init_data_physical_address.checked_add(INITCALL_ARRAY_OFFSET)?;
+    let initcall_array_virtual_address =
+        init_data_virtual_address.checked_add(INITCALL_ARRAY_OFFSET)?;
+    let phase_offset = match phase {
+        InitcallPhase::EarlyInitcall => 0usize,
+        InitcallPhase::CoreInitcall => 8,
+        InitcallPhase::PostCoreInitcall => 0x10,
+        InitcallPhase::ArchInitcall => 0x18,
+        InitcallPhase::SubsysInitcall => 0x20,
+        InitcallPhase::FsInitcall => 0x28,
+        InitcallPhase::DeviceInitcall => 0x30,
+        InitcallPhase::LateInitcall => 0x38,
+        InitcallPhase::ConsoleInitcall => 0x40,
     };
-    let initcall_ptr = (unsafe { core::ptr::read(initcall_ptr_address as *const i32) } as i64
-        + initcall_ptr_address as i64) as usize;
+    let initcall_ptr_physical_address =
+        initcall_array_physical_address.checked_add(phase_offset)?;
+    let initcall_ptr_virtual_address =
+        initcall_array_virtual_address.checked_add(phase_offset)?;
+    let initcall_ptr_end =
+        initcall_ptr_physical_address.checked_add(core::mem::size_of::<u64>())?;
+    let kernel_end = kernel_base.checked_add(kernel_size)?;
+
+    if initcall_ptr_physical_address < kernel_base || initcall_ptr_end > kernel_end {
+        return None;
+    }
+
     debug!(
-        "Initcall pointer for phase {:?} is at address: {:#x}",
+        "Reading initcall slot for phase {:?}: virt={:#x}, phys={:#x}",
+        phase, initcall_ptr_virtual_address, initcall_ptr_physical_address
+    );
+
+    let initcall_target_virtual_address =
+        usize::try_from(unsafe { core::ptr::read(initcall_ptr_physical_address as *const u64) })
+            .ok()?;
+
+    if initcall_target_virtual_address == 0 {
+        debug!("Initcall slot for phase {:?} contains a null pointer", phase);
+        return None;
+    }
+
+    debug!(
+        "Initcall slot for phase {:?} contains absolute virt target {:#x} (slot virt={:#x})",
+        phase, initcall_target_virtual_address, initcall_ptr_virtual_address
+    );
+
+    let initcall_ptr = translate_virtual_to_physical(
+        &vmlinux,
+        kernel_base,
+        kernel_size,
+        initcall_target_virtual_address,
+    )?;
+    debug!(
+        "Initcall pointer for phase {:?} resolves to physical address: {:#x}",
         phase, initcall_ptr
     );
-    Some(initcall_ptr as usize)
+    Some(initcall_ptr)
+}
+
+fn translate_virtual_to_physical(
+    vmlinux: &ElfBytes<AnyEndian>,
+    kernel_base: usize,
+    kernel_size: usize,
+    target_virtual_address: usize,
+) -> Option<usize> {
+    let segments = vmlinux.segments()?;
+
+    for segment in segments.iter() {
+        if segment.p_type != PT_LOAD {
+            continue;
+        }
+
+        let segment_virtual_start = usize::try_from(segment.p_vaddr).ok()?;
+        let segment_offset = usize::try_from(segment.p_offset).ok()?;
+        let segment_file_size = usize::try_from(segment.p_filesz).ok()?;
+        let segment_memory_size = usize::try_from(segment.p_memsz).ok()?;
+        let segment_virtual_end = segment_virtual_start.checked_add(segment_memory_size)?;
+
+        if target_virtual_address < segment_virtual_start
+            || target_virtual_address >= segment_virtual_end
+        {
+            continue;
+        }
+
+        let offset_in_segment = target_virtual_address.checked_sub(segment_virtual_start)?;
+        if offset_in_segment >= segment_memory_size || offset_in_segment >= segment_file_size {
+            return None;
+        }
+
+        let target_offset = segment_offset.checked_add(offset_in_segment)?;
+        if target_offset >= kernel_size {
+            return None;
+        }
+
+        let target_physical_address = kernel_base.checked_add(target_offset)?;
+        debug!(
+            "Translated target virt={:#x} via PT_LOAD(vaddr={:#x}, offset={:#x}) to phys={:#x}",
+            target_virtual_address, segment_virtual_start, segment_offset, target_physical_address
+        );
+        return Some(target_physical_address);
+    }
+
+    debug!(
+        "Failed to translate target virt={:#x} to a physical PT_LOAD-backed address",
+        target_virtual_address
+    );
+    None
 }
