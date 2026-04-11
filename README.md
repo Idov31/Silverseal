@@ -21,6 +21,14 @@ Silverseal is a Linux framework containing a bootkit and a rootkit.
 ./scripts/wsl_setup.sh
 ```
 
+To build the rootkit against your wanted target kernel, you need to run the following script on your build machine (either WSL or a native Linux machine):
+
+```bash
+./scripts/ubuntu_target_setup.sh <uname -r of your target kernel>
+```
+
+This flow expects the target Ubuntu kernel to already have `CONFIG_RUST=y`. It also verifies the `linux-lib-rust-<kernel>` package linkage under `/usr/src/linux-headers-<kernel>/rust`, because a broken symlink there can cause external Rust module builds to fail with `can't find crate for core`.
+
 ## Build
 
 * Build the rootkit
@@ -28,6 +36,27 @@ Silverseal is a Linux framework containing a bootkit and a rootkit.
 ```bash
 cd Silverseal/silverseal-rootkit
 make
+```
+
+* Build the rootkit for an Ubuntu generic target kernel from WSL
+
+```bash
+cd Silverseal/silverseal-rootkit
+PATH=/usr/bin:/bin:$PATH \
+RUST_LIB_SRC=/usr/src/rustc-1.82.0/library \
+make RUST_MIN_TOOLCHAIN= \
+KDIR=/usr/src/linux-headers-6.17.0-20-generic \
+CC=x86_64-linux-gnu-gcc-13 \
+RUSTC=rustc-1.82 \
+RUSTDOC=rustdoc-1.82
+```
+
+The module Makefile auto-detects `/usr/src/linux-headers-*` targets and passes the Rust compatibility cfg through Kbuild's Rust flag variables so the newer Ubuntu `module!` metadata schema uses `authors` instead of the older `author` key.
+
+After the build, verify the target kernel version was embedded correctly:
+
+```bash
+modinfo target/silverseal_rootkit.ko | grep vermagic
 ```
 
 * Build the bootkit

@@ -11,6 +11,16 @@
 
 use kernel::prelude::*;
 
+#[cfg(kernel_module_authors_plural)]
+module! {
+    type: SilversealRootkit,
+    name: "silverseal_rootkit",
+    authors: ["Ido Veltzman <idov3110@gmail.com>"],
+    description: "Silverseal hello world Rust LKM",
+    license: "GPL",
+}
+
+#[cfg(not(kernel_module_authors_plural))]
 module! {
     type: SilversealRootkit,
     name: "silverseal_rootkit",
