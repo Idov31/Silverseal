@@ -4,34 +4,60 @@
 
 Silverseal is a Linux framework containing a bootkit and a rootkit.
 
-## Setup
+## Installing Dependencies
 
-### Repository Setup
-
-* Clone the repository
+### Ubuntu
 
 ```bash
-git clone https://github.com/idov31/Silverseal.git
+./scripts/install_dependencies.sh
 ```
 
-* Build the project
+### WSL
+
+> ![IMPORTANT]
+> If you're using WSL, make sure to set up WSL 2 and install Ubuntu. This script is going to replace the default WSL kernel with a custom one that supports Rust.
 
 ```bash
-cd Silverseal
-cargo build-all --release
+./scripts/wsl_setup.sh
 ```
 
-* Replace the grub
+## Build
+
+* Build the rootkit
 
 ```bash
-# Copy Silverseal.efi to the same directory as setup_silverseal.sh and run the script
+cd Silverseal/silverseal-rootkit
+make
+```
+
+* Build the bootkit
+
+```bash
+cd Silverseal/silverseal-bootkit
+cargo build --release
+```
+
+## Test
+
+You can use the `setup_silverseal.sh` script to replace the current GRUB with the Silverseal bootkit.
+
+```bash
 chmod +x setup_silverseal.sh
 sudo ./setup_silverseal.sh
 ```
 
-### Serial Logging Setup
+## Remove Silverseal
 
-#### Linux
+To remove Silverseal, you can use the `restore_silverseal.sh` script to restore the original GRUB configuration.
+
+```bash
+chmod +x restore_silverseal.sh
+sudo ./restore_silverseal.sh
+```
+
+## Serial Logging Setup
+
+### Linux
 
 * **Identify the serial port:**
 
@@ -53,7 +79,7 @@ sudo screen /dev/ttyS0 115200
 sudo picocom -b 115200 /dev/ttyS0
 ```
 
-#### Windows
+### Windows
 
 * Download and run [PuTTY](https://www.putty.org/)
 * Select "Serial" connection type
