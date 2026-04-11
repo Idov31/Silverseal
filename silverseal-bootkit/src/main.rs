@@ -28,7 +28,7 @@ fn main() -> Status {
         .base(COM1_PORT)
         .filter(LevelFilter::Debug)
         .setup();
-    // debug!("{}", LOGO);
+    debug!("{}", LOGO);
 
     let original_grub_handle = match load_original_grub() {
         Ok(handle) => handle,

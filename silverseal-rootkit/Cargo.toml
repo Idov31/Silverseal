@@ -3,7 +3,7 @@ name = "silverseal-rootkit"
 version = "1.0.0"
 edition = "2024"
 authors = ["Ido Veltzman <idov3110@gmail.com>"]
-# autobins = false prevents Cargo from auto-detecting src/main.rs as a binary target
+# Keep Cargo limited to the IDE stub; Kbuild owns the real module build.
 autobins = false
 build = "build.rs"
 
