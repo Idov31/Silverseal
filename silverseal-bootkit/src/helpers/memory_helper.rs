@@ -353,10 +353,10 @@ pub fn translate_virtual_to_physical(
         }
 
         let target_physical_address = kernel_base.checked_add(target_offset)?;
-        debug!(
-            "Translated target virt={:#x} via PT_LOAD(vaddr={:#x}, offset={:#x}) to phys={:#x}",
-            target_virtual_address, segment_virtual_start, segment_offset, target_physical_address
-        );
+        // debug!(
+        //     "Translated target virt={:#x} via PT_LOAD(vaddr={:#x}, offset={:#x}) to phys={:#x}",
+        //     target_virtual_address, segment_virtual_start, segment_offset, target_physical_address
+        // );
         return Some(target_physical_address);
     }
 

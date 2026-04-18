@@ -117,6 +117,80 @@ pub fn cave_finder(
     None
 }
 
+/// ## Description
+/// cave_finder_by_section_name searches a specific named ELF section for a
+/// contiguous cave filled with `0x00` and/or `0x90` bytes, regardless of the
+/// section's permission flags.
+///
+/// ## Arguments
+/// - `data_address`: Base address of the in-memory ELF image.
+/// - `data_size`: Total size of the in-memory ELF image.
+/// - `cave_size`: Required contiguous cave size in bytes.
+/// - `section_name`: Exact name of the ELF section to search.
+///
+/// ## Returns
+/// - `Some(usize)`: Absolute (physical) address of the first matching cave.
+/// - `None`: If parsing fails or no suitable cave exists.
+pub fn cave_finder_by_section_name(
+    data_address: usize,
+    data_size: usize,
+    cave_size: usize,
+    section_name: &str,
+) -> Option<usize> {
+    if data_address == 0 || data_size == 0 || cave_size == 0 {
+        return None;
+    }
+
+    let data = unsafe { core::slice::from_raw_parts(data_address as *const u8, data_size) };
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(data).ok()?;
+    let (sections_opt, strtab_opt) = elf.section_headers_with_strtab().ok()?;
+    let sections = sections_opt?;
+    let strtab = strtab_opt?;
+
+    for section in sections.iter() {
+        if section.sh_size == 0 {
+            continue;
+        }
+
+        let name = strtab.get(section.sh_name as usize).unwrap_or("");
+        if name != section_name {
+            continue;
+        }
+
+        let Some(section_offset) = usize::try_from(section.sh_offset).ok() else {
+            continue;
+        };
+        let Some(section_size) = usize::try_from(section.sh_size).ok() else {
+            continue;
+        };
+        let Some(section_end): Option<usize> = section_offset.checked_add(section_size) else {
+            continue;
+        };
+
+        if section_end > data.len() {
+            continue;
+        }
+
+        let section_data = &data[section_offset..section_end];
+        let Some(cave_offset) = find_cave_offset(section_data, cave_size) else {
+            continue;
+        };
+
+        let cave_address = section_offset
+            .checked_add(cave_offset)
+            .and_then(|offset| data_address.checked_add(offset));
+        if let Some(address) = cave_address {
+            debug!(
+                "Found code cave in section {}: section_virt={:#x}, cave_offset={:#x}, address={:#x}",
+                section_name, section.sh_addr, cave_offset, address
+            );
+        }
+        return cave_address;
+    }
+
+    None
+}
+
 fn section_matches_permissions(section: &SectionHeader, requested: Permissions) -> bool {
     if requested.is_empty() {
         return true;
