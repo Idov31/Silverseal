@@ -26,7 +26,7 @@ fn main() {
 
     println!("cargo:rustc-env=LKM_LOADER_BIN={}", bin_output.display());
 
-    // Assemble the 41-byte stager blob.
+    // Assemble the 29-byte stager blob.
     let stager_source = PathBuf::from("asm/x64/lkm_stager.asm");
     let stager_output = out_dir.join("lkm_stager.bin");
 
