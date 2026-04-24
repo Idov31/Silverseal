@@ -1,0 +1,4 @@
+[alias]
+build-bootkit = "build -p silverseal-bootkit --target x86_64-unknown-uefi"
+build-rootkit = "build -p silverseal-rootkit"
+build-all = "build -p silverseal-rootkit -p silverseal-bootkit --target x86_64-unknown-uefi"

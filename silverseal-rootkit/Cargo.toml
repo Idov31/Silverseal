@@ -1,0 +1,21 @@
+[package]
+name = "silverseal-rootkit"
+version = "1.0.0"
+edition = "2024"
+authors = ["Ido Veltzman <idov3110@gmail.com>"]
+# Keep Cargo limited to the IDE stub; Kbuild owns the real module build.
+autobins = false
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+# Kernel modules require abort-on-panic; no unwinding in kernel space
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
