@@ -20,7 +20,7 @@ Installs the packages needed for Rust-for-Linux external module builds, installs
 
 ### WSL
 
-> ![IMPORTANT]
+> ![IMPORTANT]  
 > If you're using WSL, make sure to set up WSL 2 and install Ubuntu. This script builds a custom Rust-enabled WSL2 kernel, prepares a modules VHDX, and can optionally write a Windows `.wslconfig` entry that points WSL at the generated kernel.
 
 ```bash
