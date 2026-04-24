@@ -1,11 +1,6 @@
 #![no_main]
 #![no_std]
 
-const COM1_PORT: u16 = 0x3f8;
-
-#[allow(dead_code)]
-const COM2_PORT: u16 = 0x2f8;
-
 use com_logger;
 use log::{debug, error, info, LevelFilter};
 use uefi::boot::{self};
@@ -16,6 +11,7 @@ pub mod helpers;
 use crate::helpers::{
     file_helper::{increase_fail_attempts, is_faulty_env, load_original_grub},
     memory_helper::{LINUX_BOOT_IMAGE_SIGNATURE, binary_search, inline_hook},
+    printing_constants::{COM1_PORT, LOGO},
 };
 
 pub mod hooks;
@@ -32,7 +28,7 @@ fn main() -> Status {
         .base(COM1_PORT)
         .filter(LevelFilter::Debug)
         .setup();
-    info!("Silverseal logo placeholder");
+    debug!("{}", LOGO);
 
     let original_grub_handle = match load_original_grub() {
         Ok(handle) => handle,
@@ -77,7 +73,7 @@ fn main() -> Status {
             GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE = hook_info;
         }
     }
-    debug!("Starting GRUB...");
+    info!("Starting GRUB...");
 
     if let Err(e) = boot::start_image(original_grub_handle) {
         error!("Failed to start original GRUB: {:?}", e);
