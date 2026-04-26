@@ -48,4 +48,30 @@ fn main() {
     }
 
     println!("cargo:rustc-env=LKM_STAGER_BIN={}", stager_output.display());
+
+    // Assemble the 29-byte worker_resume blob.
+    let worker_resume_source = PathBuf::from("asm/x64/lkm_worker_resume.asm");
+    let worker_resume_output = out_dir.join("lkm_worker_resume.bin");
+
+    println!("cargo:rerun-if-changed={}", worker_resume_source.display());
+
+    let status = Command::new("nasm")
+        .args([
+            "-f",
+            "bin",
+            "-o",
+            worker_resume_output.to_str().unwrap(),
+            worker_resume_source.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to run nasm. Is it installed?");
+
+    if !status.success() {
+        panic!("nasm failed to assemble {}", worker_resume_source.display());
+    }
+
+    println!(
+        "cargo:rustc-env=LKM_WORKER_RESUME_BIN={}",
+        worker_resume_output.display()
+    );
 }
