@@ -5,6 +5,8 @@ target
 
 # Github stuff
 .github/
+*.md
+!README.md
 
 # Drawio
 *.drawio.bkp
