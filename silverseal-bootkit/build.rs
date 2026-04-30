@@ -4,8 +4,31 @@ use std::process::Command;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let asm_source = PathBuf::from("asm/x64/lkm_loader.asm");
-    let bin_output = out_dir.join("lkm_loader.bin");
+    let loader_output = assemble_blob(&out_dir, "asm/x64/lkm_loader.asm", "lkm_loader.bin");
+    println!("cargo:rustc-env=LKM_LOADER_BIN={}", loader_output.display());
+
+    // Assemble the initcall stager blob.
+    let stager_output = assemble_blob(&out_dir, "asm/x64/lkm_stager.asm", "lkm_stager.bin");
+    println!("cargo:rustc-env=LKM_STAGER_BIN={}", stager_output.display());
+
+    // Assemble the split worker blobs.
+    let worker_output = assemble_blob(&out_dir, "asm/x64/lkm_worker.asm", "lkm_worker.bin");
+    println!("cargo:rustc-env=LKM_WORKER_BIN={}", worker_output.display());
+
+    let worker_tail_output = assemble_blob(
+        &out_dir,
+        "asm/x64/lkm_worker_tail.asm",
+        "lkm_worker_tail.bin",
+    );
+    println!(
+        "cargo:rustc-env=LKM_WORKER_TAIL_BIN={}",
+        worker_tail_output.display()
+    );
+}
+
+fn assemble_blob(out_dir: &PathBuf, source: &str, output_name: &str) -> PathBuf {
+    let asm_source = PathBuf::from(source);
+    let bin_output = out_dir.join(output_name);
 
     println!("cargo:rerun-if-changed={}", asm_source.display());
 
@@ -24,51 +47,5 @@ fn main() {
         panic!("nasm failed to assemble {}", asm_source.display());
     }
 
-    println!("cargo:rustc-env=LKM_LOADER_BIN={}", bin_output.display());
-
-    // Assemble the initcall stager blob.
-    let stager_source = PathBuf::from("asm/x64/lkm_stager.asm");
-    let stager_output = out_dir.join("lkm_stager.bin");
-
-    println!("cargo:rerun-if-changed={}", stager_source.display());
-
-    let status = Command::new("nasm")
-        .args([
-            "-f",
-            "bin",
-            "-o",
-            stager_output.to_str().unwrap(),
-            stager_source.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run nasm. Is it installed?");
-
-    if !status.success() {
-        panic!("nasm failed to assemble {}", stager_source.display());
-    }
-
-    println!("cargo:rustc-env=LKM_STAGER_BIN={}", stager_output.display());
-
-    // Assemble the worker blob.
-    let worker_source = PathBuf::from("asm/x64/lkm_worker.asm");
-    let worker_output = out_dir.join("lkm_worker.bin");
-
-    println!("cargo:rerun-if-changed={}", worker_source.display());
-
-    let status = Command::new("nasm")
-        .args([
-            "-f",
-            "bin",
-            "-o",
-            worker_output.to_str().unwrap(),
-            worker_source.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run nasm. Is it installed?");
-
-    if !status.success() {
-        panic!("nasm failed to assemble {}", worker_source.display());
-    }
-
-    println!("cargo:rustc-env=LKM_WORKER_BIN={}", worker_output.display());
+    bin_output
 }

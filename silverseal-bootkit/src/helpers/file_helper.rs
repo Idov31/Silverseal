@@ -120,12 +120,12 @@ pub fn cave_finder(
 /// ## Description
 /// get_section_address_by_name returns the absolute address of the first byte of the specified section,
 /// or None if parsing fails or the section doesn't exist.
-/// 
+///
 /// ## Arguments
 /// - `data_address`: Base address of the in-memory ELF image.
 /// - `data_size`: Total size of the in-memory ELF image.
 /// - `section_name`: Exact name of the ELF section to find.
-/// 
+///
 /// ## Returns
 /// - `Some(usize)`: Absolute address of the first byte of the specified section.
 /// - `None`: If parsing fails or the section doesn't exist.
@@ -369,7 +369,9 @@ pub fn cave_finder_by_section_name_after(
             continue;
         }
 
-        let Some(cave_offset_in_slice) = find_cave_offset(&section_data[start_in_section..], cave_size) else {
+        let Some(cave_offset_in_slice) =
+            find_cave_offset(&section_data[start_in_section..], cave_size)
+        else {
             continue;
         };
 
@@ -388,7 +390,6 @@ pub fn cave_finder_by_section_name_after(
 
     None
 }
-
 
 fn section_matches_permissions(section: &SectionHeader, requested: Permissions) -> bool {
     if requested.is_empty() {

