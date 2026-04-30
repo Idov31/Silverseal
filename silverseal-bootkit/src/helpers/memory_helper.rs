@@ -282,12 +282,8 @@ pub fn get_initcall_phase_address(
     let last_entry_virt = phase_end_virt.checked_sub(4)?;
 
     // Translate the entry's virtual address to a physical (in-memory) address.
-    let last_entry_phys = translate_virtual_to_physical(
-        &vmlinux,
-        kernel_base,
-        kernel_size,
-        last_entry_virt,
-    )?;
+    let last_entry_phys =
+        translate_virtual_to_physical(&vmlinux, kernel_base, kernel_size, last_entry_virt)?;
 
     if last_entry_phys.checked_add(4)? > kernel_end {
         return None;
@@ -428,4 +424,14 @@ pub fn translate_physical_to_virtual(
         physical_address
     );
     None
+}
+
+/// Finds the byte offset of a 4-byte sentinel value within a buffer.
+pub fn find_sentinel_4(buf: &[u8], sentinel: &[u8; 4]) -> Option<usize> {
+    buf.windows(4).position(|w| w == sentinel)
+}
+
+/// Finds the byte offset of an 8-byte sentinel value within a buffer.
+pub fn find_sentinel_8(buf: &[u8], sentinel: &[u8; 8]) -> Option<usize> {
+    buf.windows(8).position(|w| w == sentinel)
 }

@@ -26,7 +26,7 @@ fn main() {
 
     println!("cargo:rustc-env=LKM_LOADER_BIN={}", bin_output.display());
 
-    // Assemble the 29-byte stager blob.
+    // Assemble the initcall stager blob.
     let stager_source = PathBuf::from("asm/x64/lkm_stager.asm");
     let stager_output = out_dir.join("lkm_stager.bin");
 
@@ -49,7 +49,7 @@ fn main() {
 
     println!("cargo:rustc-env=LKM_STAGER_BIN={}", stager_output.display());
 
-    // Assemble the 31-byte lkm_worker blob.
+    // Assemble the worker blob.
     let worker_source = PathBuf::from("asm/x64/lkm_worker.asm");
     let worker_output = out_dir.join("lkm_worker.bin");
 
@@ -70,8 +70,5 @@ fn main() {
         panic!("nasm failed to assemble {}", worker_source.display());
     }
 
-    println!(
-        "cargo:rustc-env=LKM_WORKER_BIN={}",
-        worker_output.display()
-    );
+    println!("cargo:rustc-env=LKM_WORKER_BIN={}", worker_output.display());
 }

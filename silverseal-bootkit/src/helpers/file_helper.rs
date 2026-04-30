@@ -178,6 +178,63 @@ pub fn cave_finder_by_section_name(
     cave_size: usize,
     section_name: &str,
 ) -> Option<usize> {
+    cave_finder_by_section_name_excluding(data_address, data_size, cave_size, section_name, &[])
+}
+
+/// ## Description
+/// Searches a named ELF section for a cave while excluding address ranges that
+/// have already been reserved for other injected blobs.
+///
+/// ## Arguments
+/// - `data_address` - Base address of the in-memory ELF image.
+/// - `data_size` - Total size of the in-memory ELF image.
+/// - `cave_size` - Required contiguous cave size in bytes.
+/// - `section_name` - Exact name of the ELF section to search.
+/// - `excluded_ranges` - Absolute physical address ranges to avoid.
+///
+/// ## Returns
+/// - `Some(usize)` - Absolute physical address of the first non-overlapping cave.
+/// - `None` - If parsing fails or no suitable cave exists.
+pub fn cave_finder_by_section_name_excluding(
+    data_address: usize,
+    data_size: usize,
+    cave_size: usize,
+    section_name: &str,
+    excluded_ranges: &[(usize, usize)],
+) -> Option<usize> {
+    cave_finder_by_section_name_excluding_after(
+        data_address,
+        data_size,
+        cave_size,
+        section_name,
+        excluded_ranges,
+        0,
+    )
+}
+
+/// ## Description
+/// Searches a named ELF section for a cave while excluding address ranges and
+/// skipping the first `min_section_offset` bytes of that section.
+///
+/// ## Arguments
+/// - `data_address` - Base address of the in-memory ELF image.
+/// - `data_size` - Total size of the in-memory ELF image.
+/// - `cave_size` - Required contiguous cave size in bytes.
+/// - `section_name` - Exact name of the ELF section to search.
+/// - `excluded_ranges` - Absolute physical address ranges to avoid.
+/// - `min_section_offset` - Minimum offset inside the section to consider.
+///
+/// ## Returns
+/// - `Some(usize)` - Absolute physical address of the first matching cave.
+/// - `None` - If parsing fails or no suitable cave exists.
+pub fn cave_finder_by_section_name_excluding_after(
+    data_address: usize,
+    data_size: usize,
+    cave_size: usize,
+    section_name: &str,
+    excluded_ranges: &[(usize, usize)],
+    min_section_offset: usize,
+) -> Option<usize> {
     if data_address == 0 || data_size == 0 || cave_size == 0 {
         return None;
     }
@@ -213,20 +270,31 @@ pub fn cave_finder_by_section_name(
         }
 
         let section_data = &data[section_offset..section_end];
-        let Some(cave_offset) = find_cave_offset(section_data, cave_size) else {
-            continue;
-        };
+        let mut search_start = min_section_offset;
+        while search_start <= section_data.len().saturating_sub(cave_size) {
+            let Some(relative_offset) = find_cave_offset(&section_data[search_start..], cave_size)
+            else {
+                break;
+            };
+            let cave_offset = search_start.checked_add(relative_offset)?;
+            let cave_address = section_offset
+                .checked_add(cave_offset)
+                .and_then(|offset| data_address.checked_add(offset))?;
+            let cave_end = cave_address.checked_add(cave_size)?;
 
-        let cave_address = section_offset
-            .checked_add(cave_offset)
-            .and_then(|offset| data_address.checked_add(offset));
-        if let Some(address) = cave_address {
-            debug!(
-                "Found code cave in section {}: section_virt={:#x}, cave_offset={:#x}, address={:#x}",
-                section_name, section.sh_addr, cave_offset, address
-            );
+            if excluded_ranges
+                .iter()
+                .all(|(start, end)| cave_end <= *start || cave_address >= *end)
+            {
+                debug!(
+                    "Found code cave in section {}: section_virt={:#x}, cave_offset={:#x}, address={:#x}",
+                    section_name, section.sh_addr, cave_offset, cave_address
+                );
+                return Some(cave_address);
+            }
+
+            search_start = cave_offset.checked_add(1)?;
         }
-        return cave_address;
     }
 
     None

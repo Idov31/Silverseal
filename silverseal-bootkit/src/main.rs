@@ -2,7 +2,7 @@
 #![no_std]
 
 use com_logger;
-use log::{debug, error, info, LevelFilter};
+use log::{LevelFilter, debug, error, info};
 use uefi::boot::{self};
 use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
