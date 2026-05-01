@@ -8,8 +8,8 @@
 ;
 ; Sentinels patched as i32/u8 by Rust before writing blob:
 ;   CALL_UMH_REL_SENTINEL              0xDDEEFF00  rel32 for call call_usermodehelper
-;   PATH_DISP_SENTINEL                 0xCCDDEE11  disp32 for lea rdi,[rip+d]
-;   ARGV_DISP_SENTINEL                 0xCCDDEE22  disp32 for lea rsi,[rip+d]
+;   PATH_DISP_SENTINEL                 0xCCDDEE11  disp32 for lea rdi,[rip+0xd]
+;   ARGV_DISP_SENTINEL                 0xCCDDEE22  disp32 for lea rsi,[rip+0xd]
 ;   MODULE_FROM_PATH_OFFSET_SENTINEL   0x7F        module path offset from argv[0]
 
 BITS 64

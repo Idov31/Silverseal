@@ -313,6 +313,18 @@ pub fn get_initcall_phase_address(
     })
 }
 
+/// ## Description
+/// translate_virtual_to_physical converts a kernel virtual address to a physical (in-memory) address by reversing the PT_LOAD segment mapping.
+///
+/// ## Arguments
+/// - `vmlinux`: Parsed ELF image of the kernel.
+/// - `kernel_base`: Base address of the in-memory ELF image.
+/// - `kernel_size`: Total size of the in-memory ELF image.
+/// - `target_virtual_address`: The kernel virtual address to translate.
+/// 
+/// ## Returns
+/// - `Some(usize)`: The corresponding physical address in memory.
+/// - `None`: If the virtual address does not fall within any PT_LOAD segment or if the translation fails.
 pub fn translate_virtual_to_physical(
     vmlinux: &ElfBytes<AnyEndian>,
     kernel_base: usize,
@@ -349,10 +361,6 @@ pub fn translate_virtual_to_physical(
         }
 
         let target_physical_address = kernel_base.checked_add(target_offset)?;
-        // debug!(
-        //     "Translated target virt={:#x} via PT_LOAD(vaddr={:#x}, offset={:#x}) to phys={:#x}",
-        //     target_virtual_address, segment_virtual_start, segment_offset, target_physical_address
-        // );
         return Some(target_physical_address);
     }
 
@@ -426,12 +434,30 @@ pub fn translate_physical_to_virtual(
     None
 }
 
-/// Finds the byte offset of a 4-byte sentinel value within a buffer.
+/// ## Description
+/// find_sentinel_4 searches for a 4-byte sentinel value within a given buffer and returns its byte offset if found.
+/// 
+/// ## Arguments
+/// - `buf`: The buffer to search within.
+/// - `sentinel`: The 4-byte sentinel value to search for.
+/// 
+/// ## Returns
+/// - `Some(usize)`: The byte offset of the sentinel within the buffer if found.
+/// - `None`: If the sentinel is not found in the buffer.
 pub fn find_sentinel_4(buf: &[u8], sentinel: &[u8; 4]) -> Option<usize> {
     buf.windows(4).position(|w| w == sentinel)
 }
 
-/// Finds the byte offset of an 8-byte sentinel value within a buffer.
+/// ## Description
+/// find_sentinel_8 searches for an 8-byte sentinel value within a given buffer and returns its byte offset if found.
+/// 
+/// ## Arguments
+/// - `buf`: The buffer to search within.
+/// - `sentinel`: The 8-byte sentinel value to search for.
+/// 
+/// ## Returns
+/// - `Some(usize)`: The byte offset of the sentinel within the buffer if found.
+/// - `None`: If the sentinel is not found in the buffer.
 pub fn find_sentinel_8(buf: &[u8], sentinel: &[u8; 8]) -> Option<usize> {
     buf.windows(8).position(|w| w == sentinel)
 }

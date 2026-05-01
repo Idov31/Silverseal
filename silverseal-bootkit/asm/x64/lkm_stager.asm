@@ -6,8 +6,8 @@
 ; initcall. No code is executed from .data.
 ;
 ; Sentinels patched as i32 PC-relative offsets by Rust:
-;   WORK_STRUCT_DISP_SENTINEL   0x11223344  disp32 for lea rdi,[rip+d]
-;   LKM_WORKER_DISP_SENTINEL    0xAABBCCEE  disp32 for lea rax,[rip+d]
+;   WORK_STRUCT_DISP_SENTINEL   0x11223344  disp32 for lea rdi,[rip+0xd]
+;   LKM_WORKER_DISP_SENTINEL    0xAABBCCEE  disp32 for lea rax,[rip+0xd]
 ;   SCHEDULE_WORK_REL_SENTINEL  0xAABBCCDD  rel32 for call schedule_work
 ;   ORIGINAL_FN_REL_SENTINEL    0x12345678  rel32 for jmp original initcall
 
