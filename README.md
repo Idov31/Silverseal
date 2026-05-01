@@ -2,7 +2,12 @@
 
 ![Silverseal Logo](./resources/silverseal_logo.png)
 
-Silverseal is a Linux framework containing a bootkit and a rootkit.
+![rust](https://img.shields.io/badge/Rust-black?style=for-the-badge&logo=rust&logoColor=#E57324) ![assembly](https://img.shields.io/badge/ASSEMBLY-ED8B00?style=for-the-badge&logo=Assembly&logoColor=white) ![linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+
+Silverseal is a Linux post exploitation framework that demonstrates the ability of a UEFI bootkit to persistently and stealthily load a Rust-based kernel module rootkit on modern Linux systems. The project includes:
+
+- [silverseal-bootkit](./silverseal-bootkit): A UEFI bootkit implemented in Rust that hooks the Linux kernel's early boot process to load the rootkit module.
+- [silverseal-rootkit](./silverseal-rootkit): A Rust-based Linux kernel module.
 
 ## Design
 
