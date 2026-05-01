@@ -1,7 +1,6 @@
 #![no_main]
 #![no_std]
 
-use com_logger;
 use log::{LevelFilter, debug, error, info};
 use uefi::boot::{self};
 use uefi::prelude::*;
@@ -15,7 +14,7 @@ use crate::helpers::{
 };
 
 pub mod hooks;
-use crate::hooks::hooks::{
+use crate::hooks::boot_hooks::{
     GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE, grub_arch_efi_linux_boot_image_hook,
 };
 
