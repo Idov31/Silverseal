@@ -321,7 +321,7 @@ pub fn get_initcall_phase_address(
 /// - `kernel_base`: Base address of the in-memory ELF image.
 /// - `kernel_size`: Total size of the in-memory ELF image.
 /// - `target_virtual_address`: The kernel virtual address to translate.
-/// 
+///
 /// ## Returns
 /// - `Some(usize)`: The corresponding physical address in memory.
 /// - `None`: If the virtual address does not fall within any PT_LOAD segment or if the translation fails.
@@ -436,11 +436,11 @@ pub fn translate_physical_to_virtual(
 
 /// ## Description
 /// find_sentinel_4 searches for a 4-byte sentinel value within a given buffer and returns its byte offset if found.
-/// 
+///
 /// ## Arguments
 /// - `buf`: The buffer to search within.
 /// - `sentinel`: The 4-byte sentinel value to search for.
-/// 
+///
 /// ## Returns
 /// - `Some(usize)`: The byte offset of the sentinel within the buffer if found.
 /// - `None`: If the sentinel is not found in the buffer.
@@ -450,11 +450,11 @@ pub fn find_sentinel_4(buf: &[u8], sentinel: &[u8; 4]) -> Option<usize> {
 
 /// ## Description
 /// find_sentinel_8 searches for an 8-byte sentinel value within a given buffer and returns its byte offset if found.
-/// 
+///
 /// ## Arguments
 /// - `buf`: The buffer to search within.
 /// - `sentinel`: The 8-byte sentinel value to search for.
-/// 
+///
 /// ## Returns
 /// - `Some(usize)`: The byte offset of the sentinel within the buffer if found.
 /// - `None`: If the sentinel is not found in the buffer.

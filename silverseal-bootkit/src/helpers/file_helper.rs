@@ -358,11 +358,7 @@ pub fn cave_finder_by_section_name_after(
 
         // Compute the offset within section_data to start searching from.
         let section_phys_start = data_address + section_offset;
-        let start_in_section = if after_phys > section_phys_start {
-            after_phys - section_phys_start
-        } else {
-            0
-        };
+        let start_in_section = after_phys.saturating_sub(section_phys_start);
 
         let section_data = &data[section_offset..section_end];
         if start_in_section >= section_data.len() {
