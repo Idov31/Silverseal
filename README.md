@@ -1,8 +1,30 @@
-# Silverseal
+# Silverseal - Linux Bootkit Framework
 
 ![Silverseal Logo](./resources/silverseal_logo.png)
 
-Silverseal demonstrates a UEFI bootkit that loads a Rust Linux kernel module. The repository contains the `no_std` UEFI bootkit in `silverseal-bootkit/`, the Kbuild-managed Rust module in `silverseal-rootkit/`, and deployment helpers in `scripts/`.
+![Rust](https://img.shields.io/badge/Rust-black?style=for-the-badge&logo=rust&logoColor=%23E57324) ![Assembly](https://img.shields.io/badge/ASSEMBLY-ED8B00?style=for-the-badge&logo=Assembly&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+
+Silverseal is an open-source Linux bootkit research framework written in Rust. It demonstrates how a UEFI bootkit hooks the Linux boot process to load a Rust kernel module. The repository contains:
+
+- [`silverseal-bootkit/`](./silverseal-bootkit/): the `no_std` UEFI bootkit, with architecture-specific assembly under `asm/`.
+- [`silverseal-rootkit/`](./silverseal-rootkit/): the Kbuild-managed Rust Linux kernel module.
+- [`scripts/`](./scripts/): environment, deployment, and recovery helpers.
+
+The project explores UEFI bootkit development, Linux boot-chain hooking, kernel-module loading, and pre-OS persistence in a research environment.
+
+## Design
+
+![Silverseal Design Diagram](./resources/silverseal-design.png)
+
+## x64 boot flow
+
+1. `grubx64.efi` is replaced by `silverseal-bootkit.efi`; the original is retained as `grubx64.efi.original`.
+2. The bootkit loads the saved GRUB image, hooks its Linux boot-image function, and starts GRUB. When GRUB takes its existing Linux boot path, the hook restores the original function and detours the kernel image's zstd decompressor.
+3. After the decompressor returns, the bootkit locates a late-initcall entry in the decompressed kernel. It places a stager and worker in `.text` code caves, keeps their `work_struct` and arguments in a `.data` cave, and redirects that initcall entry to the stager.
+4. During kernel initialization, the stager queues the worker with `schedule_work`, then jumps to the original initcall so it still runs.
+5. The worker sleeps for 10 seconds, then calls `call_usermodehelper` to run `/sbin/insmod /silverseal_rootkit.ko` from the real root filesystem.
+
+The x64 kernel hook uses signatures and layout assumptions from a specific Ubuntu kernel image. Matching build artifacts alone does not establish that the hook will work on another kernel; validate the target image and boot behavior in a disposable VM.
 
 ## ARM64 boot flow
 
@@ -15,7 +37,22 @@ ARM64 mirrors the existing x86 deployment model:
 5. The stager initializes a kernel `work_struct` and calls the target kernel's `schedule_work.isra.0`. Its worker sleeps for 10 seconds, then invokes `/sbin/insmod /silverseal_rootkit.ko` from the real root filesystem.
 6. The original initcall still runs.
 
-This flow does not build, replace, or load the module from initrd/initramfs. It does not use a wrapper EFI binary or a repackaged kernel. The checked-in profile is intentionally pinned to Ubuntu kernel `7.0.0-31-generic`; mismatched images fail closed. Secure Boot must be disabled for the unsigned research binaries.
+## Prepare a build environment
+
+On Ubuntu, `install_dependencies.sh` installs build packages, Rust and `rust-src`, and `bindgen-cli`. It also checks whether the running kernel advertises `CONFIG_RUST=y`. Review the script before running it because it installs packages and changes the default Rust toolchain:
+
+```bash
+./scripts/install_dependencies.sh
+```
+
+On WSL2 with Ubuntu, `wsl_setup.sh` prepares a custom Rust-enabled WSL2 kernel, a modules VHDX, and a build tree for external modules. It can optionally write a Windows `.wslconfig` entry. Review its options and the changes it makes before running it:
+
+```bash
+./scripts/wsl_setup.sh --help
+./scripts/wsl_setup.sh
+```
+
+The pinned ARM64 Ubuntu target has a separate setup flow below. `ubuntu_target_setup.sh` runs natively in that ARM64 VM and derives the required Rust version from its kernel configuration; it is not a generic WSL cross-build helper.
 
 ## Build the ARM64 rootkit in the Ubuntu VM
 
@@ -121,18 +158,50 @@ This captures bootkit messages before Linux starts. Once Linux is available, `su
 
 ## x86_64
 
-The existing x86 build remains available and requires `nasm` on `PATH`:
+The x86 UEFI build requires `nasm` on `PATH` and assembles the x64 loader and stager into the EFI image:
 
 ```bash
 cargo build-bootkit-x64 --release
-cd silverseal-rootkit && make ARCH=x86_64
 ```
 
-Deploy or restore with `scripts/setup_silverseal.sh x86_64` and `scripts/restore_silverseal.sh x86_64` respectively.
+The resulting image is `target/x86_64-unknown-uefi/release/silverseal-bootkit.efi`. Build the real module through the target kernel's Rust-enabled Kbuild tree, using matching headers and tools:
 
-## Safety
+```bash
+make -C silverseal-rootkit ARCH=x86_64 KDIR=/path/to/target/kernel/build
+modinfo silverseal-rootkit/target/x86_64/<kernel-release>/silverseal_rootkit.ko | grep vermagic
+```
 
-EFI replacement can make a machine unbootable. Use a disposable VM, retain the `.original` GRUB image, confirm the exact kernel/header version, and keep Secure Boot disabled for testing. Runtime ARM64 boot and module-load claims require evidence from that VM; host builds and static verification alone do not establish runtime success.
+The Makefile stages module artifacts under `silverseal-rootkit/target/x86_64/<kernel-release>/`. `cargo check -p silverseal-rootkit` checks only the IDE stub; it does not build a loadable module. For an Ubuntu generic kernel, match the target kernel's Rust version and `RUST_LIB_SRC` as well as its headers. The pinned ARM64 setup command above is specific to that VM.
+
+From the repository root in a disposable x86_64 VM, deploy the EFI image by passing its path to the setup script:
+
+```bash
+sudo ./scripts/setup_silverseal.sh x86_64 \
+  target/x86_64-unknown-uefi/release/silverseal-bootkit.efi
+```
+
+The script saves `/boot/efi/EFI/ubuntu/grubx64.efi` as `grubx64.efi.original` and installs the bootkit in its place. To restore the original GRUB image:
+
+```bash
+sudo ./scripts/restore_silverseal.sh x86_64
+```
+
+The restore helper retains the replaced image as `grubx64.efi.silverseal` for recovery.
+
+## Serial logs on x86_64
+
+With a VM serial port configured, Linux hosts can inspect `/dev/ttyS*` and monitor the corresponding port at 115200 baud using `minicom`, `screen`, or `picocom`:
+
+```bash
+ls -la /dev/ttyS*
+sudo minicom -D /dev/ttyS0 -b 115200
+```
+
+On a Windows host with a VM serial pipe at `\\.\pipe\com_1`, PuTTY can open a Serial connection at 115200 baud with no flow control. The reconnecting helper uses that fixed pipe path and requires PuTTY at `C:\Program Files\PuTTY\putty.exe`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\connect-vm.ps1
+```
 
 ## Resources
 
