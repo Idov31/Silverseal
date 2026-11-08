@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
-TARGET_DIR ?= $(PWD)/target
+HOST_ARCH := $(shell uname -m)
+ARCH ?= $(if $(filter aarch64 arm64,$(HOST_ARCH)),arm64,x86_64)
+LLVM ?= 1
+KERNEL_RELEASE ?= $(shell $(MAKE) -s -C "$(KDIR)" kernelrelease 2>/dev/null)
+TARGET_DIR ?= $(CURDIR)/target/$(ARCH)/$(KERNEL_RELEASE)
 RUSTUP_TOOLCHAIN ?=
 RUST_MIN_TOOLCHAIN := $(shell [ -x "$(KDIR)/scripts/min-tool-version.sh" ] && "$(KDIR)/scripts/min-tool-version.sh" rustc)
 RUST_TOOLCHAIN := $(if $(RUSTUP_TOOLCHAIN),$(RUSTUP_TOOLCHAIN),$(RUST_MIN_TOOLCHAIN))
@@ -33,19 +37,19 @@ ARTIFACT_GLOBS := \
 define stage_artifacts
 	@mkdir -p $(TARGET_DIR)
 	@for artifact in $(ARTIFACT_GLOBS); do \
-		if [ -e "$(PWD)/$$artifact" ]; then \
-			mv -f "$(PWD)/$$artifact" "$(TARGET_DIR)/"; \
+		if [ -e "$(CURDIR)/$$artifact" ]; then \
+			mv -f "$(CURDIR)/$$artifact" "$(TARGET_DIR)/"; \
 		fi; \
 	done
 endef
 
 default:
-	$(KBUILD_ENV) $(MAKE) -C $(KDIR) M=$(PWD) LLVM=1 $(KBUILD_RUSTFLAGS)
+	$(KBUILD_ENV) $(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) LLVM=$(LLVM) $(KBUILD_RUSTFLAGS)
 	$(stage_artifacts)
 
 modules_install: default
-	$(KBUILD_ENV) $(MAKE) -C $(KDIR) M=$(PWD) modules_install $(KBUILD_RUSTFLAGS)
+	$(KBUILD_ENV) $(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) LLVM=$(LLVM) modules_install $(KBUILD_RUSTFLAGS)
 
 clean:
-	$(KBUILD_ENV) $(MAKE) -C $(KDIR) M=$(PWD) clean $(KBUILD_RUSTFLAGS)
+	$(KBUILD_ENV) $(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) LLVM=$(LLVM) clean $(KBUILD_RUSTFLAGS)
 	@rm -rf $(TARGET_DIR)

@@ -1,170 +1,141 @@
-# Silverseal - Linux Bootkit and Rust Kernel Rootkit Framework
+# Silverseal
 
 ![Silverseal Logo](./resources/silverseal_logo.png)
 
-![rust](https://img.shields.io/badge/Rust-black?style=for-the-badge&logo=rust&logoColor=#E57324) ![assembly](https://img.shields.io/badge/ASSEMBLY-ED8B00?style=for-the-badge&logo=Assembly&logoColor=white) ![linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+Silverseal demonstrates a UEFI bootkit that loads a Rust Linux kernel module. The repository contains the `no_std` UEFI bootkit in `silverseal-bootkit/`, the Kbuild-managed Rust module in `silverseal-rootkit/`, and deployment helpers in `scripts/`.
 
-Silverseal is an open-source Linux bootkit research framework written in Rust. It demonstrates how a UEFI bootkit can hook the early Linux kernel boot process to persistently and stealthily load a Rust-based kernel module rootkit.
+## ARM64 boot flow
 
-The project explores UEFI bootkit development, Linux kernel boot-chain hooking, rootkit loading, and pre-OS persistence on modern Linux systems.
+ARM64 mirrors the existing x86 deployment model:
 
-- [silverseal-bootkit](./silverseal-bootkit): A UEFI bootkit implemented in Rust that hooks the Linux kernel's early boot process to load the rootkit module.
-- [silverseal-rootkit](./silverseal-rootkit): A Rust-based Linux kernel module.
+1. `grubaa64.efi` is replaced by `silverseal-bootkit.efi`; the original is retained as `grubaa64.efi.original`.
+2. The bootkit chain-loads that original GRUB image and detours its existing Linux boot-image path. It does not add or require a GRUB menu entry.
+3. The bootkit finds the stock ARM64 zboot PE inside the staged `vmlinuz` `.linux` section and observes its successful decompression into `vmlinux`.
+4. The decompressed kernel is matched against the exact target profile. A late-initcall entry is redirected to a position-independent stager.
+5. The stager initializes a kernel `work_struct` and calls the target kernel's `schedule_work.isra.0`. Its worker sleeps for 10 seconds, then invokes `/sbin/insmod /silverseal_rootkit.ko` from the real root filesystem.
+6. The original initcall still runs.
 
-## Design
+This flow does not build, replace, or load the module from initrd/initramfs. It does not use a wrapper EFI binary or a repackaged kernel. The checked-in profile is intentionally pinned to Ubuntu kernel `7.0.0-31-generic`; mismatched images fail closed. Secure Boot must be disabled for the unsigned research binaries.
 
-![Silverseal Design Diagram](./resources/silverseal-design.png)
+## Build the ARM64 rootkit in the Ubuntu VM
 
-## Installing Dependencies
-
-### Ubuntu
-
-Installs the packages needed for Rust-for-Linux external module builds, installs `rustup` if needed, switches the default toolchain to `stable`, adds `rust-src`, installs `bindgen-cli`, and warns if the currently running kernel does not expose `CONFIG_RUST=y`.
-
-```bash
-./scripts/install_dependencies.sh
-```
-
-### WSL
-
-> [!IMPORTANT]  
-> If you're using WSL, make sure to set up WSL 2 and install Ubuntu. This script builds a custom Rust-enabled WSL2 kernel, prepares a modules VHDX, and can optionally write a Windows .wslconfig entry that points WSL at the generated kernel.
+Use the native ARM64 Ubuntu VM on Apple Silicon. The real module must be built through the target kernel's Kbuild tree, not with Cargo's IDE stub:
 
 ```bash
-./scripts/wsl_setup.sh
-```
+cd Silverseal
+./scripts/ubuntu_target_setup.sh 7.0.0-31-generic
 
-The script automatically installs the Ubuntu build dependencies, clones the matching Microsoft WSL2 kernel source, enables `CONFIG_RUST`, builds the kernel with LLVM, and wires `/lib/modules/<release>/build` for external module builds.
-
-To see the supported options:
-
-```bash
-./scripts/wsl_setup.sh --help
-```
-
-To build the rootkit against your wanted target kernel, you need to run the following script on your build machine (either WSL or a native Linux machine):
-
-```bash
-./scripts/ubuntu_target_setup.sh <uname -r of your target kernel>
-```
-
-This flow installs the matching `linux-headers-<kernel>` and `linux-lib-rust-<kernel>` packages, installs the Ubuntu-packaged Rust 1.82 toolchain used by the generic-kernel flow, repairs `/usr/src/linux-headers-<kernel>/rust` if that symlink is broken, and prints the exact `make` command to use afterward.
-
-## Build
-
-### Rootkit
-
-Build the rootkit with the kernel build system. Do not use Cargo for the real module build.
-
-```bash
-cd Silverseal/silverseal-rootkit
-make
-```
-
-The module artifacts are staged into `silverseal-rootkit/target/` after the build.
-
-Build the rootkit for an Ubuntu generic target kernel from WSL:
-
-```bash
-cd Silverseal/silverseal-rootkit
-make clean
+cd silverseal-rootkit
+make clean ARCH=arm64 LLVM= KDIR=/lib/modules/7.0.0-31-generic/build
 PATH=/usr/bin:/bin:$PATH \
-RUST_LIB_SRC=/usr/src/rustc-1.82.0/library \
+RUST_LIB_SRC=/path/printed/by/ubuntu_target_setup.sh \
 make RUST_MIN_TOOLCHAIN= \
-KDIR=/usr/src/linux-headers-6.17.0-20-generic \
-CC=x86_64-linux-gnu-gcc-13 \
-RUSTC=rustc-1.82 \
-RUSTDOC=rustdoc-1.82
+  ARCH=arm64 \
+  LLVM= \
+  KDIR=/lib/modules/7.0.0-31-generic/build \
+  RUSTC=rustc-1.93 \
+  RUSTDOC=rustdoc-1.93
 ```
 
-The module Makefile auto-detects `/usr/src/linux-headers-*` targets and passes the Rust compatibility cfg through Kbuild's Rust flag variables so the newer Ubuntu `module!` metadata schema uses `authors` instead of the older `author` key.
-
-After the build, verify the target kernel version was embedded correctly:
+Confirm that Kbuild produced the module for the pinned kernel:
 
 ```bash
-modinfo target/silverseal_rootkit.ko | grep vermagic
+file target/arm64/7.0.0-31-generic/silverseal_rootkit.ko
+modinfo target/arm64/7.0.0-31-generic/silverseal_rootkit.ko | grep vermagic
 ```
 
-### Bootkit
+Before runtime testing, validate the target kernel's `work_struct` layout from its BTF or DWARF: size 32 bytes, `entry` at offset 8, and `func` at offset 24. A mismatch is a hard stop because those values are encoded by the stager.
 
-The bootkit build requires `nasm` on `PATH`. The crate is already configured to target `x86_64-unknown-uefi`, and the build script assembles both `asm/x64/lkm_loader.asm` and `asm/x64/lkm_stager.asm` into flat binary blobs embedded into the EFI image.
+## Build the ARM64 bootkit on macOS
 
-```bash
-cd Silverseal/silverseal-bootkit
-cargo build --release
-```
+Apple Silicon can build the AArch64 UEFI binary directly. Install stable Rust with the `aarch64-unknown-uefi` target and PowerShell (`pwsh`) for fixture verification.
 
-The resulting EFI binary is written to:
-
-```bash
-Silverseal/target/x86_64-unknown-uefi/release/silverseal-bootkit.efi
-```
-
-## Test
-
-The deployment script currently expects a file named `silverseal-bootkit.efi` in the repository root. After building the bootkit, copy the EFI artifact there and then run the setup script from the repository root.
+The large pinned artifacts are expected in `tmp/silverseal-kernel-7.0.0-31-generic/`. Generate the v3 profile after verifying their hashes, unique signatures, nested stock-zboot PE, caves, initcall, and linked System.map evidence:
 
 ```bash
 cd Silverseal
-cp target/x86_64-unknown-uefi/release/silverseal-bootkit.efi ./silverseal-bootkit.efi
-sudo ./scripts/setup_silverseal.sh
+pwsh ./scripts/verify_arm64_fixture.ps1 \
+  -ArtifactDirectory ./tmp/silverseal-kernel-7.0.0-31-generic \
+  -OutputDirectory ./target/arm64-fixture/7.0.0-31-generic-v3
+
+export SILVERSEAL_ARM64_PROFILE="$PWD/target/arm64-fixture/7.0.0-31-generic-v3/7.0.0-31-generic.ssarm64p"
+cargo build-bootkit-arm64 --release
 ```
 
-The script performs a direct swap on the EFI partition:
+The result is:
 
-- moves `/boot/efi/EFI/ubuntu/grubx64.efi` to `/boot/efi/EFI/ubuntu/grubx64.efi.original`
-- moves `./silverseal-bootkit.efi` into place as `/boot/efi/EFI/ubuntu/grubx64.efi`
+```text
+target/aarch64-unknown-uefi/release/silverseal-bootkit.efi
+```
 
-## Remove Silverseal
+An ARM64 build with no `SILVERSEAL_ARM64_PROFILE` deliberately installs no hook. The profile and small signature fixtures live under `fixtures/arm64/7.0.0-31-generic/`; the large kernel and GRUB artifacts remain ignored.
 
-To remove Silverseal, restore the original GRUB binary from the `.original` backup:
+Host-side contracts can be run with:
 
 ```bash
-cd Silverseal
-sudo ./scripts/restore_silverseal.sh
+cargo test-arm64
+cargo test -p silverseal-bootkit --bin silverseal-arm64-tool --features arm64-tools
 ```
 
-## Serial Logging Setup
+## Deploy in the ARM64 Ubuntu VM
 
-### Linux
-
-- **Identify the serial port:**
+Copy the bootkit and module into the VM, then put the module on the real root filesystem and replace the existing ARM64 GRUB binary:
 
 ```bash
-ls -la /dev/ttyS*
+sudo install -m 0644 \
+  silverseal-rootkit/target/arm64/7.0.0-31-generic/silverseal_rootkit.ko \
+  /silverseal_rootkit.ko
+
+sudo ./scripts/setup_silverseal.sh arm64 \
+  target/aarch64-unknown-uefi/release/silverseal-bootkit.efi
+sudo reboot
 ```
 
-Common ports: `/dev/ttyS0` (COM1), `/dev/ttyS1` (COM2)
-
-- **Monitor serial output with `minicom`:**
+Do not create a menu entry and do not rebuild initramfs. The VM should boot its normal existing Ubuntu entry. After boot, inspect the module result with:
 
 ```bash
-sudo minicom -D /dev/ttyS0 -b 115200
-
-# Or with `screen`:
-sudo screen /dev/ttyS0 115200
-
-# Or with `picocom`:
-sudo picocom -b 115200 /dev/ttyS0
+sudo dmesg -w
+lsmod | grep silverseal_rootkit
 ```
 
-### Windows
+To restore the saved original GRUB image:
 
-- Download and run [PuTTY](https://www.putty.org/)
-- Select "Serial" connection type
-- Enter the serial line you created in the VM (e.g., `\\.\pipe\com_1`)
-- Set speed to 115200
-- Under Connection > Serial, set "Flow control" to "None" and "Parity" to "None"
-- Click Open
-
-You can also use the helper script, which continuously reconnects PuTTY to `\\.\pipe\com_1` at `115200` baud:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\connect-vm.ps1
+```bash
+sudo ./scripts/restore_silverseal.sh arm64
 ```
+
+The restore helper keeps the replaced image as `grubaa64.efi.silverseal` for recovery.
+
+## Serial logs with VMware Fusion on macOS
+
+Add a virtual serial port to the powered-off ARM64 VM and configure its output to a file on macOS. The bootkit discovers the firmware's UEFI Serial I/O protocol; it does not assume QEMU's PL011 MMIO address. If Fusion firmware exposes no Serial I/O protocol, logging is silently disabled and boot continues.
+
+On macOS, watch the configured output file while the VM boots:
+
+```bash
+touch /path/to/fusion-serial.log
+tail -F /path/to/fusion-serial.log
+```
+
+This captures bootkit messages before Linux starts. Once Linux is available, `sudo dmesg -w` in the VM is the simpler source for the delayed worker and module logs. QEMU is not required by this workflow.
+
+## x86_64
+
+The existing x86 build remains available and requires `nasm` on `PATH`:
+
+```bash
+cargo build-bootkit-x64 --release
+cd silverseal-rootkit && make ARCH=x86_64
+```
+
+Deploy or restore with `scripts/setup_silverseal.sh x86_64` and `scripts/restore_silverseal.sh x86_64` respectively.
+
+## Safety
+
+EFI replacement can make a machine unbootable. Use a disposable VM, retain the `.original` GRUB image, confirm the exact kernel/header version, and keep Secure Boot disabled for testing. Runtime ARM64 boot and module-load claims require evidence from that VM; host builds and static verification alone do not establish runtime success.
 
 ## Resources
 
-- [UEFI Crate](https://rust-osdev.github.io/uefi-rs/how_to/protocols.html)
+- [UEFI crate](https://rust-osdev.github.io/uefi-rs/how_to/protocols.html)
 - [Elixir Bootlin](https://elixir.bootlin.com/linux)
 - [memN0p's Bootkit](https://github.com/memN0ps/redlotus-rs)

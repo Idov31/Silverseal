@@ -6,6 +6,9 @@ members = [
 ]
 resolver = "3"
 
+[patch.crates-io]
+com_logger = { path = "vendor/com_logger" }
+
 [profile.dev]
 panic = "abort"
 

@@ -3,10 +3,16 @@
 debug
 target
 
-# Github stuff
+# AI Stuff
+.project/
+.codex/
+.ai_marketplace/
 .github/
-*.md
-!README.md
+.agents/
+
+# Temporary files and directories
+fixtures/
+
 
 # Drawio
 *.drawio.bkp
@@ -34,3 +40,4 @@ TASKS.md
 # Added by cargo
 
 /target
+/tmp/

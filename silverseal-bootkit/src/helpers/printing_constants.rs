@@ -1,3 +1,4 @@
+#[cfg(target_arch = "x86_64")]
 pub const COM1_PORT: u16 = 0x3f8;
 pub const COM2_PORT: u16 = 0x2f8;
 pub const LOGO: &str = "                                        

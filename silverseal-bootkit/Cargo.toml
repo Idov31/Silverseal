@@ -4,6 +4,15 @@ version = "1.0.0"
 edition = "2024"
 authors = ["Ido Veltzman <idov3110@gmail.com>"]
 
+[[bin]]
+name = "silverseal-arm64-tool"
+path = "src/bin/silverseal-arm64-tool.rs"
+required-features = ["arm64-tools"]
+
+[features]
+default = []
+arm64-tools = []
+
 [dependencies]
 log = "0.4.29"
 com_logger = "0.1.2"
