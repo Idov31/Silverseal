@@ -8,7 +8,7 @@
 fn main() {
     println!(
         "cargo:warning=silverseal-rootkit is built with Kbuild, not Cargo. \
-         Use: make KDIR=/lib/modules/$(uname -r)/build M=$PWD LLVM=1"
+         Use: make KDIR=/lib/modules/$(uname -r)/build ARCH=x86_64 (or ARCH=arm64)"
     );
 
     println!("cargo:rerun-if-changed=silverseal_rootkit.rs");

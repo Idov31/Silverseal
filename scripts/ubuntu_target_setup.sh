@@ -1,23 +1,22 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
-readonly DEFAULT_RUST_VERSION="1.82"
-readonly DEFAULT_GCC_VERSION="13"
-
 usage() {
     cat <<'EOF'
-Usage: ./scripts/ubuntu_target_setup.sh [kernel-release]
+Usage: ./scripts/ubuntu_target_setup.sh [kernel-release] [rust-version]
 
-Prepares a WSL Ubuntu environment to build the Silverseal rootkit against a
-Rust-enabled Ubuntu generic kernel such as 6.17.0-20-generic.
+Prepares an Ubuntu ARM64 VM to build the Silverseal module against a matching
+Rust-enabled Ubuntu generic kernel. The Rust version is derived from the target
+kernel config when possible; pass it explicitly (for example 1.93.1) only when
+the config is unavailable.
 
 This script:
   1. installs the matching Ubuntu header and linux-lib-rust packages
-  2. installs the Ubuntu-packaged Rust toolchain used for generic-kernel builds
+  2. installs the Ubuntu-packaged Rust series required by the target kernel
   3. verifies that /usr/src/linux-headers-<release>/rust resolves correctly
   4. repairs the rust symlink if the header tree points at a missing package path
-  5. prints the exact make command to build the module from WSL
+  5. prints the exact native ARM64 Kbuild command to use afterward
 EOF
 }
 
@@ -30,21 +29,57 @@ die() {
     exit 1
 }
 
-have_command() {
-    command -v "$1" >/dev/null 2>&1
+derive_rust_version() {
+    local kernel_release="$1"
+    local config_path=""
+    local encoded=""
+
+    for candidate in "/boot/config-${kernel_release}" "/lib/modules/${kernel_release}/build/.config"; do
+        if [ -r "${candidate}" ]; then
+            config_path="${candidate}"
+            break
+        fi
+    done
+
+    [ -n "${config_path}" ] || return 1
+    encoded="$(sed -n 's/^CONFIG_RUSTC_VERSION=//p' "${config_path}" | head -n 1)"
+    case "${encoded}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+
+    # Linux encodes compiler versions as major * 100000 + minor * 100 + patch.
+    printf '%d.%d.%d\n' \
+        "$((encoded / 100000))" \
+        "$(((encoded / 100) % 1000))" \
+        "$((encoded % 100))"
 }
 
-ensure_wsl_or_ubuntu() {
-    if [ ! -d /usr/src ]; then
-        die "This script must run in a Linux environment with /usr/src available."
-    fi
+package_exists() {
+    apt-cache show "$1" >/dev/null 2>&1
 }
 
 install_packages() {
     local kernel_release="$1"
+    local rust_version="$2"
+    local rust_series="${rust_version%.*}"
+    local rust_packages=()
 
-    log "Installing Ubuntu packages for target kernel ${kernel_release}..."
-    sudo apt update
+    for package in \
+        "cargo-${rust_series}" \
+        "rustc-${rust_series}" \
+        "rust-${rust_series}-src" \
+        "libstd-rust-${rust_series}" \
+        "libstd-rust-${rust_series}-dev"; do
+        if package_exists "${package}"; then
+            rust_packages+=("${package}")
+        fi
+    done
+
+    if [ "${#rust_packages[@]}" -eq 0 ]; then
+        die "No Ubuntu Rust ${rust_series} packages are visible. Enable the matching Ubuntu repository or pass the correct kernel Rust version."
+    fi
+
+    log "Installing packages for target kernel ${kernel_release} and Rust ${rust_version}..."
     sudo apt install -y \
         "linux-headers-${kernel_release}" \
         "linux-lib-rust-${kernel_release}" \
@@ -57,13 +92,8 @@ install_packages() {
         flex \
         bison \
         dwarves \
-        "gcc-${DEFAULT_GCC_VERSION}" \
         bindgen \
-        "cargo-${DEFAULT_RUST_VERSION}" \
-        "rustc-${DEFAULT_RUST_VERSION}" \
-        "rust-${DEFAULT_RUST_VERSION}-src" \
-        "libstd-rust-${DEFAULT_RUST_VERSION}" \
-        "libstd-rust-${DEFAULT_RUST_VERSION}-dev"
+        "${rust_packages[@]}"
 }
 
 repair_header_rust_symlink() {
@@ -113,34 +143,57 @@ verify_kernel_rust_tree() {
     log "Rust kernel artifacts are present under ${resolved_path}"
 }
 
+find_rust_source() {
+    local rust_version="$1"
+    local rust_series="${rust_version%.*}"
+
+    for candidate in \
+        "/usr/src/rustc-${rust_version}/library" \
+        "/usr/src/rustc-${rust_series}.0/library" \
+        "/usr/lib/rustlib/src/rust/library"; do
+        if [ -d "${candidate}" ]; then
+            printf '%s\n' "${candidate}"
+            return
+        fi
+    done
+    return 1
+}
+
 print_build_instructions() {
     local kernel_release="$1"
+    local rust_version="$2"
+    local rust_series="${rust_version%.*}"
+    local rust_source
+
+    rust_source="$(find_rust_source "${rust_version}")" || die "Could not locate the Rust ${rust_version} library sources."
 
     cat <<EOF
 
-Ubuntu target kernel setup is complete.
+Ubuntu ARM64 target kernel setup is complete.
 
-Next build command from WSL:
+Next build command on the ARM64 VM:
 
   cd /path/to/Silverseal/silverseal-rootkit
-  make clean
+  make clean ARCH=arm64 KDIR=/lib/modules/${kernel_release}/build
   PATH=/usr/bin:/bin:\$PATH \\
-  RUST_LIB_SRC=/usr/src/rustc-${DEFAULT_RUST_VERSION}.0/library \\
+  RUST_LIB_SRC=${rust_source} \\
   make RUST_MIN_TOOLCHAIN= \\
-  KDIR=/usr/src/linux-headers-${kernel_release} \\
-  CC=x86_64-linux-gnu-gcc-${DEFAULT_GCC_VERSION} \\
-  RUSTC=rustc-${DEFAULT_RUST_VERSION} \\
-  RUSTDOC=rustdoc-${DEFAULT_RUST_VERSION}
+  ARCH=arm64 \\
+  KDIR=/lib/modules/${kernel_release}/build \\
+  RUSTC=rustc-${rust_series} \\
+  RUSTDOC=rustdoc-${rust_series}
 
 Validation after build:
 
-  readlink -f /usr/src/linux-headers-${kernel_release}/rust
-  modinfo target/silverseal_rootkit.ko | grep vermagic
+  readlink -f /lib/modules/${kernel_release}/build/rust
+  file target/arm64/${kernel_release}/silverseal_rootkit.ko
+  modinfo target/arm64/${kernel_release}/silverseal_rootkit.ko | grep vermagic
 EOF
 }
 
 main() {
     local kernel_release="${1:-}"
+    local rust_version="${2:-}"
 
     if [ "${kernel_release}" = "--help" ] || [ "${kernel_release}" = "-h" ]; then
         usage
@@ -148,14 +201,22 @@ main() {
     fi
 
     if [ -z "${kernel_release}" ]; then
-        die "Please pass the target Ubuntu kernel release, for example: 6.17.0-20-generic"
+        die "Please pass the target Ubuntu kernel release, for example: 7.0.0-31-generic"
+    fi
+    if [ "$(uname -m)" != "aarch64" ]; then
+        die "Run this helper natively in the ARM64 target VM (uname -m must be aarch64)."
     fi
 
-    ensure_wsl_or_ubuntu
-    install_packages "${kernel_release}"
+    if [ -z "${rust_version}" ]; then
+        rust_version="$(derive_rust_version "${kernel_release}")" || die "Could not derive CONFIG_RUSTC_VERSION; pass the exact version as the second argument."
+    fi
+
+    log "Target kernel requires Rust ${rust_version}"
+    sudo apt update
+    install_packages "${kernel_release}" "${rust_version}"
     repair_header_rust_symlink "${kernel_release}"
     verify_kernel_rust_tree "${kernel_release}"
-    print_build_instructions "${kernel_release}"
+    print_build_instructions "${kernel_release}" "${rust_version}"
 }
 
 main "$@"

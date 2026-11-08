@@ -20,9 +20,9 @@ rule silverseal_uefi_bootkit_x64 {
         $hook_log_caves = "Caves: stager virt=" ascii
         $hook_log_decompressed = "Decompressed linux kernel is at address:" ascii
 
-        $pattern_call_usermodehelper = { 81 C6 C0 0D 00 00 48 C1 E8 3C }
-        $pattern_schedule_work = { 48 89 FA BF 00 20 00 00 }
-        $pattern_msleep = { 48 89 C3 66 90 41 C7 44 24 18 02 }
+        $pattern_call_usermodehelper = { E8 5B E3 F8 FF 55 83 F9 01 48 89 E5 41 56 41 89 CE 41 55 48 8B 45 08 }
+        $pattern_schedule_work = { 55 48 8B 35 1B 9B D7 02 48 89 FA BF 00 20 00 00 48 89 E5 E8 33 E2 AE FF }
+        $pattern_msleep = { E8 CB B7 E7 FF 55 48 89 E5 E8 C2 6B FF FF 48 85 C0 74 10 48 89 C7 }
 
         $sentinel_argv0 = { AA AA AA AA AA AA AA AA }
         $sentinel_call_umh = { 00 FF EE DD }

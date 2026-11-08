@@ -16,7 +16,10 @@ use log::debug;
 extern crate alloc;
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "x86_64")]
 const GRUB_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\grubx64.efi.original");
+#[cfg(target_arch = "aarch64")]
+const GRUB_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\grubaa64.efi.original");
 const FAILSAFE_PATH: &CStr16 = cstr16!("\\EFI\\ubuntu\\failsafe");
 const MAX_FAIL_ATTEMPTS: u16 = 1;
 

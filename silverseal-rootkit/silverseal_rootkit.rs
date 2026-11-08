@@ -3,7 +3,9 @@
 //! Minimal Silverseal Rust-for-Linux test module.
 //!
 //! Build with:
-//!   make KDIR=/lib/modules/$(uname -r)/build M=$PWD LLVM=1
+//!   make KDIR=/lib/modules/$(uname -r)/build ARCH=x86_64
+//! Cross-build for ARM64 with a matching Rust-enabled kernel tree:
+//!   make KDIR=/path/to/arm64/kernel/build ARCH=arm64
 //! Load with:
 //!   sudo insmod silverseal_rootkit.ko
 //! Verify:

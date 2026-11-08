@@ -1,2 +1,2 @@
 [toolchain]
-targets = ["x86_64-unknown-uefi"]
+targets = ["x86_64-unknown-uefi", "aarch64-unknown-uefi"]

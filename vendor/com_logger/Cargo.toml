@@ -1,0 +1,19 @@
+[package]
+name = "com_logger"
+version = "0.1.2"
+authors = ["Yushi OMOTE <yushiomote@gmail.com>"]
+edition = "2018"
+description = "Serial port logger through COM ports and PL011 MMIO"
+homepage = "https://github.com/yushiomote/com_logger"
+repository = "https://github.com/yushiomote/com_logger"
+documentation = "https://docs.rs/com_logger"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+log = { version = "0.4.22", default-features = false }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+uart_16550 = "0.3.0"
+
+[workspace]

