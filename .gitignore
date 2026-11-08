@@ -10,10 +10,6 @@ target
 .github/
 .agents/
 
-# Temporary files and directories
-fixtures/
-
-
 # Drawio
 *.drawio.bkp
 
